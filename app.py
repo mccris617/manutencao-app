@@ -1,22 +1,23 @@
 # app.py
 import streamlit as st
 from datetime import datetime
-from supabase_client import supabase
-
-# Inicializa o estado do usuário
-if "user" not in st.session_state:
-    st.session_state["user"] = None
 
 # ----------- Funções Auxiliares (ESCOPO GLOBAL) -----------
 def load_technicians():
+    from supabase_client import get_supabase_client
+    supabase = get_supabase_client()
     res = supabase.table("technicians").select("*").execute()
     return {t["id"]: t for t in res.data} if res.data else {}
 
 def load_locations():
+    from supabase_client import get_supabase_client
+    supabase = get_supabase_client()
     res = supabase.table("locations").select("*").execute()
     return {l["id"]: l["name"] for l in res.data} if res.data else {}
 
 def load_environments_by_location(loc_id):
+    from supabase_client import get_supabase_client
+    supabase = get_supabase_client()
     if not loc_id:
         return {}
     res = supabase.table("environments").select("*").eq("location_id", loc_id).execute()
@@ -29,12 +30,17 @@ def get_location_name(loc_id, loc_dict):
     return loc_dict.get(loc_id, "—")
 
 def get_specialties_list():
+    from supabase_client import get_supabase_client
+    supabase = get_supabase_client()
     res = supabase.table("technicians").select("specialty").execute()
     specialties = {r["specialty"] for r in res.data if r.get("specialty")}
     return sorted(specialties) if specialties else ["Refrigeração", "Elétrica", "Hidráulica", "Mecânica"]
 
 # ----------- Login -----------
 def show_login():
+    from supabase_client import get_supabase_client
+    supabase = get_supabase_client()
+    
     st.set_page_config(page_title="🔐 Login", layout="centered")
     st.title("🔐 Login - Sistema de Manutenção")
     email = st.text_input("E-mail", key="login_email")
@@ -60,6 +66,9 @@ def show_login():
 
 # ----------- App Principal -----------
 def show_main_app():
+    from supabase_client import get_supabase_client
+    supabase = get_supabase_client()
+    
     user = st.session_state["user"]
     user_role = user["role"]
     user_specialty = user.get("specialty")
@@ -183,6 +192,14 @@ def show_main_app():
     # --- ABA: Kanban (todos) ---
     with tab_kanban:
         st.subheader("Quadro Kanban – Manutenções")
+
+        # Filtros
+        all_specialties = get_specialties_list()
+        selected_specialty = st.selectbox("Filtrar por Especialidade", ["Todas"] + all_specialties, key="filter_specialty")
+        all_locations = load_locations()
+        selected_location = st.selectbox("Filtrar por Localidade", ["Todas"] + list(all_locations.values()), key="filter_location")
+        search_query = st.text_input("Buscar por título", key="search_title")
+
         techs = load_technicians()
         locs = load_locations()
         statuses = ["scheduled", "in_progress", "completed", "overdue"]
@@ -197,18 +214,47 @@ def show_main_app():
             with cols[i]:
                 st.markdown(f"### {status_labels[status]}")
                 query = supabase.table("maintenance_tasks").select("*").eq("status", status).order("due_date", desc=False)
+                
+                if selected_specialty != "Todas":
+                    query = query.eq("specialty", selected_specialty)
+                if selected_location != "Todas":
+                    loc_id_by_name = {v: k for k, v in all_locations.items()}
+                    loc_id = loc_id_by_name.get(selected_location)
+                    if loc_id:
+                        query = query.eq("location_id", loc_id)
                 if user_role == "technician":
                     if user_specialty:
                         query = query.eq("specialty", user_specialty)
                     else:
                         query = query.eq("technician_id", user["id"])
+                
                 tasks = query.execute().data
+                if search_query:
+                    tasks = [t for t in tasks if search_query.lower() in t["title"].lower()]
+                
                 for task in tasks:
                     with st.expander(f"**{task['title']}**", expanded=False):
                         st.write(f"📍 Local: {get_location_name(task['location_id'], locs)}")
                         st.write(f"🔧 Especialidade: {task.get('specialty', '—')}")
                         st.write(f"👤 Técnico: {get_technician_name(task['technician_id'], techs)}")
                         st.write(f"📆 Vencimento: {task['due_date'][:16].replace('T', ' ')}")
+                        
+                        # Checklist interativo
+                        checklist = supabase.table("checklists").select("*").eq("task_id", task["id"]).execute().data
+                        if checklist:
+                            st.write("**Checklist:**")
+                            for item in checklist:
+                                can_edit_check = (user_role == "manager") or (task["technician_id"] == user["id"])
+                                checked = st.checkbox(
+                                    item["item"],
+                                    value=item["is_completed"],
+                                    key=f"check_{item['id']}",
+                                    disabled=not can_edit_check
+                                )
+                                if checked != item["is_completed"]:
+                                    supabase.table("checklists").update({"is_completed": checked}).eq("id", item["id"]).execute()
+                                    st.rerun()
+                        
                         can_act = (user_role == "manager") or (task["technician_id"] == user["id"])
                         if can_act:
                             col_a, col_b = st.columns(2)
@@ -220,11 +266,6 @@ def show_main_app():
                                 if st.button("Concluir", key=f"done_{task['id']}", use_container_width=True):
                                     supabase.table("maintenance_tasks").update({"status": "completed"}).eq("id", task["id"]).execute()
                                     st.rerun()
-                        checklist = supabase.table("checklists").select("*").eq("task_id", task["id"]).execute().data
-                        if checklist:
-                            st.write("**Checklist:**")
-                            for item in checklist:
-                                st.checkbox(item["item"], value=item["is_completed"], disabled=True)
 
     # --- ABA: Minhas Atividades (só técnicos) ---
     if user_role == "technician":
@@ -255,6 +296,9 @@ def show_main_app():
             st.write("⚙️ Configurações (em breve)")
 
 # ----------- Execução Principal -----------
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+
 if st.session_state["user"] is None:
     show_login()
 else:
