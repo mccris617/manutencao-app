@@ -1,19 +1,14 @@
-# supabase_client.py
-from supabase import create_client, Client
-import streamlit as st
+from supabase import create_client
 import os
 from dotenv import load_dotenv
 
-# Carrega variáveis (local ou Streamlit Cloud)
-load_dotenv()
-url = os.getenv("SUPABASE_URL")
-key = os.getenv("SUPABASE_KEY")
+load_dotenv()  # <– carrega .env automaticamente
 
-if not url or not key:
-    url = st.secrets.get("SUPABASE_URL")
-    key = st.secrets.get("SUPABASE_KEY")
+def get_supabase_client():
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
 
-if not url or not key:
-    raise ValueError("❌ SUPABASE_URL ou SUPABASE_KEY não configurados.")
+    if not url or not key:
+        raise ValueError("⚠️ Variáveis SUPABASE_URL ou SUPABASE_KEY não foram carregadas!")
 
-supabase: Client = create_client(url, key)
+    return create_client(url, key)
