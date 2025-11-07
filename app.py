@@ -1,4 +1,11 @@
 # app.py
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from supabase_client import get_supabase_client
+
 import streamlit as st
 from datetime import datetime
 from supabase_client import get_supabase_client
