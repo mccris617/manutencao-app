@@ -1,4 +1,4 @@
-# app.py — Sistema de Manutenção Preventiva (versão com debug de ambientes)
+# app.py — Sistema de Manutenção Preventiva (versão final com campo de texto para ambiente)
 import streamlit as st
 from datetime import datetime, timedelta
 from supabase_client import get_supabase_client
@@ -66,17 +66,19 @@ def get_next_due_date(due_date, recurrence):
             return due_date.replace(month=due_date.month + 1)
     return None
 
-# ----------- Função: Gerar PDF -----------
+# ----------- Função: Gerar PDF (com verificação de existência de fonte) -----------
 def generate_pdf(task, technician_name, location_name, environment_name, checklist_items):
-    pdf = FPDF()
-    pdf.add_page()
-    base_dir = os.path.dirname(__file__)
-    font_normal = os.path.join(base_dir, "DejaVuSans.ttf")
-    font_bold = os.path.join(base_dir, "DejaVuSans-Bold.ttf")
+    # Verificar se as fontes existem antes de usar
+    font_normal = os.path.join(os.path.dirname(__file__), "DejaVuSans.ttf")
+    font_bold = os.path.join(os.path.dirname(__file__), "DejaVuSans-Bold.ttf")
+
     if not os.path.exists(font_normal):
         raise FileNotFoundError("Falta: DejaVuSans.ttf")
     if not os.path.exists(font_bold):
         raise FileNotFoundError("Falta: DejaVuSans-Bold.ttf")
+
+    pdf = FPDF()
+    pdf.add_page()
     pdf.add_font("DejaVu", "", font_normal, uni=True)
     pdf.add_font("DejaVu", "B", font_bold, uni=True)
     pdf.add_font("DejaVu", "I", font_normal, uni=True)
@@ -117,11 +119,22 @@ def generate_pdf(task, technician_name, location_name, environment_name, checkli
 st.set_page_config(page_title="🔧 Manutenção Preventiva", layout="wide")
 st.title("🔧 Sistema de Manutenção Preventiva")
 
+# Verificação de fontes (com debug)
 base_dir = os.path.dirname(__file__)
 required = ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf"]
-missing = [f for f in required if not os.path.exists(os.path.join(base_dir, f))]
+found = []
+missing = []
+
+for font in required:
+    font_path = os.path.join(base_dir, font)
+    if os.path.exists(font_path):
+        found.append(font)
+    else:
+        missing.append(font)
+
 if missing:
     st.sidebar.error(f"⚠️ Fontes ausentes: {', '.join(missing)}")
+    st.sidebar.info("💡 Certifique-se de que os arquivos estão na mesma pasta do app.py")
 else:
     st.sidebar.success("✅ Fontes OK")
 
@@ -317,7 +330,7 @@ else:
                 if st.session_state[expand_data_key]:
                     st.markdown(f"**Especialidade:** `{task.get('specialty', '—')}`")
                     st.markdown(f"**Técnico:** {get_technician_name(task['technician_id'], techs)}")
-                    st.markdown(f"**Local:** {get_location_name(task['location_id'], locs)} → {get_environment_name(task['environment_id'], load_environments())}")
+                    st.markdown(f"**Local:** {get_location_name(task['location_id'], locs)} → {task.get('environment_id', '—')}")  # 🔥 Agora exibe nome do ambiente
                     due = task['due_date'][:16].replace('T', ' ')
                     st.markdown(f"**Agendado para:** {due}")
                     st.markdown(f"**Recorrência:** {task.get('recurrence', 'Nenhuma')}")
@@ -389,7 +402,7 @@ else:
                                 "specialty": original_task.get("specialty"),
                                 "technician_id": original_task.get("technician_id"),
                                 "location_id": original_task.get("location_id"),
-                                "environment_id": original_task.get("environment_id"),
+                                "environment_id": original_task.get("environment_id"),  # 🔥 Mantém o ambiente original como texto
                                 "due_date": next_due.isoformat(),
                                 "recurrence": recurrence,
                                 "status": "scheduled",
@@ -445,7 +458,7 @@ else:
                 with col4:
                     technician_name = get_technician_name(task['technician_id'], techs)
                     location_name = get_location_name(task['location_id'], locs)
-                    environment_name = get_environment_name(task['environment_id'], load_environments())
+                    environment_name = task.get('environment_id', '—')  # 🔥 Agora exibe nome do ambiente
                     checklist_items = [{"id": item["id"], "text": item["item"], "checked": item["is_completed"]} for item in checklist_data]
                     try:
                         pdf_bytes = generate_pdf(task, technician_name, location_name, environment_name, checklist_items)
@@ -493,7 +506,7 @@ else:
                 if st.session_state[expand_data_key]:
                     st.markdown(f"**Especialidade:** `{task.get('specialty', '—')}`")
                     st.markdown(f"**Técnico:** {get_technician_name(task['technician_id'], techs)}")
-                    st.markdown(f"**Local:** {get_location_name(task['location_id'], locs)} → {get_environment_name(task['environment_id'], load_environments())}")
+                    st.markdown(f"**Local:** {get_location_name(task['location_id'], locs)} → {task.get('environment_id', '—')}")  # 🔥 Exibe nome do ambiente
                     due = task['due_date'][:16].replace('T', ' ')
                     st.markdown(f"**Agendado para:** {due}")
 
@@ -521,7 +534,7 @@ else:
                 with col2:
                     technician_name = get_technician_name(task['technician_id'], techs)
                     location_name = get_location_name(task['location_id'], locs)
-                    environment_name = get_environment_name(task['environment_id'], load_environments())
+                    environment_name = task.get('environment_id', '—')  # 🔥 Exibe nome do ambiente
                     checklist_items = [{"id": item["id"], "text": item["item"], "checked": item["is_completed"]} for item in checklist_data]
                     try:
                         pdf_bytes = generate_pdf(task, technician_name, location_name, environment_name, checklist_items)
