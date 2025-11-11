@@ -1,4 +1,4 @@
-# app.py — Sistema de Manutenção Preventiva (versão final com campo de texto para ambiente)
+# app.py — Sistema de Manutenção Preventiva (com histórico, arquivamento e notificações)
 import streamlit as st
 from datetime import datetime, timedelta
 from supabase_client import get_supabase_client
@@ -9,6 +9,8 @@ supabase = get_supabase_client()
 
 if "show_new_form" not in st.session_state:
     st.session_state["show_new_form"] = False
+if "show_history" not in st.session_state:
+    st.session_state["show_history"] = False
 
 status_labels = {
     "scheduled": "📅 Agendada",
@@ -37,7 +39,13 @@ def load_locations():
 
 def load_environments():
     res = supabase.table("environments").select("*").execute()
-    return {e["id"]: e for e in res.data} if res.data else {}
+    return {e["id"]: e["name"] for e in res.data} if res.data else {}
+
+def load_environments_by_location(loc_id):
+    if not loc_id:
+        return {}
+    res = supabase.table("environments").select("*").eq("location_id", loc_id).execute()
+    return {e["id"]: e["name"] for e in res.data} if res.data else {}
 
 def get_technician_name(tech_id, tech_dict):
     return tech_dict.get(str(tech_id), {}).get("name", "Não atribuído")
@@ -52,6 +60,10 @@ def get_specialties_list():
     res = supabase.table("technicians").select("specialty").execute()
     specialties = {r["specialty"] for r in res.data if r.get("specialty")}
     return sorted(specialties) if specialties else ["Refrigeração", "Elétrica", "Hidráulica", "Mecânica"]
+
+def load_templates():
+    res = supabase.table("templates").select("*").execute()
+    return res.data if res.data else []
 
 # ----------- Função: Calcular próxima data com recorrência -----------
 def get_next_due_date(due_date, recurrence):
@@ -68,7 +80,6 @@ def get_next_due_date(due_date, recurrence):
 
 # ----------- Função: Gerar PDF (com verificação de existência de fonte) -----------
 def generate_pdf(task, technician_name, location_name, environment_name, checklist_items):
-    # Verificar se as fontes existem antes de usar
     font_normal = os.path.join(os.path.dirname(__file__), "DejaVuSans.ttf")
     font_bold = os.path.join(os.path.dirname(__file__), "DejaVuSans-Bold.ttf")
 
@@ -115,6 +126,46 @@ def generate_pdf(task, technician_name, location_name, environment_name, checkli
     pdf.cell(0, 8, f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True)
     return bytes(pdf.output(dest='S'))
 
+# ----------- Função: Mostrar notificações internas -----------
+def show_notifications():
+    today = datetime.now().date()
+    tomorrow = today + timedelta(days=1)
+    # Buscar tarefas próximas ou atrasadas
+    res = supabase.table("maintenance_tasks").select("*").in_("status", ["scheduled", "overdue"]).execute()
+    tasks = res.data or []
+    late = [t for t in tasks if t["status"] == "overdue"]
+    upcoming = [t for t in tasks if t["due_date"].startswith(str(tomorrow))]
+
+    if late:
+        st.warning(f"❗ {len(late)} tarefa(s) atrasada(s)")
+
+    if upcoming:
+        st.info(f"📅 {len(upcoming)} tarefa(s) agendada(s) para amanhã")
+
+# ----------- Função: Arquivar tarefa automaticamente ao concluir -----------
+def archive_task(task, checklist_items):
+    try:
+        supabase.table("task_history").insert({
+            "task_id": task["id"],
+            "title": task["title"],
+            "description": task.get("description"),
+            "specialty": task.get("specialty"),
+            "technician_id": task.get("technician_id"),
+            "location_id": task.get("location_id"),
+            "environment_name": task.get("environment_id"),
+            "due_date": task["due_date"],
+            "completed_at": datetime.now().isoformat(),
+            "checklist": [
+                {"item": item["text"], "is_completed": item["is_completed"]}
+                for item in checklist_items
+            ],
+            "recurrence": task.get("recurrence"),
+            "created_from_template": task.get("is_template", False),
+            "notes": ""
+        }).execute()
+    except Exception as e:
+        st.error(f"Erro ao arquivar: {str(e)}")
+
 # ----------- Página Principal -----------
 st.set_page_config(page_title="🔧 Manutenção Preventiva", layout="wide")
 st.title("🔧 Sistema de Manutenção Preventiva")
@@ -137,6 +188,9 @@ if missing:
     st.sidebar.info("💡 Certifique-se de que os arquivos estão na mesma pasta do app.py")
 else:
     st.sidebar.success("✅ Fontes OK")
+
+# Mostrar notificações
+show_notifications()
 
 # --- Cadastros na sidebar ---
 with st.sidebar:
@@ -181,6 +235,37 @@ with st.sidebar:
         else:
             st.info("Cadastre uma localidade primeiro.")
 
+    # --- Modelos ---
+    st.header("📂 Modelos")
+    templates = load_templates()
+    if templates:
+        selected_template = st.selectbox(
+            "Usar modelo",
+            options=[t["id"] for t in templates],
+            format_func=lambda x: next(t["title"] for t in templates if t["id"] == x)
+        )
+        if st.button("➕ Criar com Modelo"):
+            template = next(t for t in templates if t["id"] == selected_template)
+            st.session_state["cloned_task"] = {
+                "title": template["title"],
+                "description": template["description"],
+                "specialty": template["specialty"],
+                "technician_id": template["technician_id"],
+                "location_id": None,
+                "environment_id": None,
+                "checklist_input": "\n".join(template.get("checklist", [])),
+                "recurrence": template.get("recurrence")
+            }
+            st.session_state["show_new_form"] = True
+            st.rerun()
+    else:
+        st.info("Nenhum modelo salvo.")
+
+    # --- Histórico ---
+    if st.button("📋 Histórico"):
+        st.session_state["show_history"] = True
+        st.rerun()
+
 # --- Filtros principais ---
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -202,39 +287,49 @@ if st.button("➕ Nova Atividade", type="primary"):
 if st.session_state.get("show_new_form"):
     st.markdown("### ➕ Nova Atividade de Manutenção")
     
+    # Se veio de clonagem ou modelo, carrega os dados
+    cloned = st.session_state.get("cloned_task", {})
+    
     with st.form("form_new_task"):
-        title = st.text_input("Título *")
-        description = st.text_area("Descrição")
+        title = st.text_input("Título *", value=cloned.get("title", ""))
+        description = st.text_area("Descrição", value=cloned.get("description", ""))
         specialties = get_specialties_list()
-        specialty = st.selectbox("Especialidade *", specialties + ["Outra"])
+        specialty = st.selectbox("Especialidade *", specialties + ["Outra"], index=specialties.index(cloned.get("specialty")) if cloned.get("specialty") and cloned.get("specialty") in specialties else len(specialties))
         if specialty == "Outra":
-            specialty = st.text_input("Nova especialidade")
+            specialty = st.text_input("Nova especialidade", value=cloned.get("specialty", ""))
+
         techs = load_technicians()
-        tech_id = st.selectbox("Técnico", options=[None] + list(techs.keys()), format_func=lambda x: techs[x]["name"] if x else "—")
-        
-        # Localidade (mantém como selectbox)
+        default_tech_idx = list(techs.keys()).index(cloned["technician_id"]) + 1 if cloned.get("technician_id") and cloned["technician_id"] in techs else 0
+        tech_id = st.selectbox("Técnico", options=[None] + list(techs.keys()), format_func=lambda x: techs[x]["name"] if x else "—", index=default_tech_idx)
+
         locs = load_locations()
-        loc_id = st.selectbox(
-            "Localidade *",
-            options=[None] + list(locs.keys()),
-            format_func=lambda x: locs[x] if x else "Selecione uma localidade"
-        )
+        default_loc_idx = list(locs.keys()).index(cloned["location_id"]) + 1 if cloned.get("location_id") and cloned["location_id"] in locs else 0
+        loc_id = st.selectbox("Localidade *", options=[None] + list(locs.keys()), format_func=lambda x: locs[x] if x else "—", index=default_loc_idx)
 
         # 🔥 Ambiente agora é campo de texto
-        environment_name = st.text_input("Nome do Ambiente *", help="Digite o nome do ambiente onde a atividade será executada")
+        environment_name = st.text_input("Nome do Ambiente", value=cloned.get("environment_id", ""), help="Digite o nome do ambiente onde a atividade será executada")
 
-        due_date = st.date_input("Data de Agendamento *")
-        due_time = st.time_input("Hora *")
-        recurrence = st.selectbox("Recorrência", ["Nenhuma", "Diária", "Semanal", "Mensal"])
-        checklist_input = st.text_area("Checklist (um item por linha)", help="Será salvo com a tarefa")
+        due_date = st.date_input("Data de Agendamento *", value=datetime.now())
+        due_time = st.time_input("Hora *", value=datetime.now().time())
+
+        recurrence_map_inv = {None: "Nenhuma", "daily": "Diária", "weekly": "Semanal", "monthly": "Mensal"}
+        current_recurrence = cloned.get("recurrence", "Nenhuma")
+        rec_index = ["Nenhuma", "Diária", "Semanal", "Mensal"].index(current_recurrence) if current_recurrence in ["Nenhuma", "Diária", "Semanal", "Mensal"] else 0
+        recurrence = st.selectbox("Recorrência", ["Nenhuma", "Diária", "Semanal", "Mensal"], index=rec_index)
+
+        checklist_input = st.text_area("Checklist (um item por linha)", 
+                                       value=cloned.get("checklist_input", ""), 
+                                       help="Será salvo com a tarefa")
+
         col1, col2 = st.columns(2)
         with col1:
             submit = st.form_submit_button("✅ Criar")
         with col2:
             cancel = st.form_submit_button("Cancelar")
+
         if submit:
-            if not title or not loc_id or not environment_name or not specialty:
-                st.error("Título, localidade, ambiente e especialidade são obrigatórios.")
+            if not title or not loc_id or not specialty:
+                st.error("Título, localidade e especialidade são obrigatórios.")
             else:
                 due_dt = datetime.combine(due_date, due_time)
                 status = "scheduled" if due_dt >= datetime.now() else "overdue"
@@ -245,7 +340,7 @@ if st.session_state.get("show_new_form"):
                     "specialty": specialty,
                     "technician_id": tech_id,
                     "location_id": str(loc_id),
-                    "environment_id": None,  # 🔥 Agora não usamos mais ID de ambiente
+                    "environment_id": None,  # 🔥 Agora ambiente é salvo como texto no card, não como ID
                     "due_date": due_dt.isoformat(),
                     "recurrence": recurrence_map[recurrence],
                     "status": status,
@@ -261,14 +356,61 @@ if st.session_state.get("show_new_form"):
                             "is_completed": False
                         }).execute()
                 st.success("✅ Atividade criada!")
+                st.session_state.pop("cloned_task", None)
                 st.session_state["show_new_form"] = False
                 st.rerun()
+
         if cancel:
+            st.session_state.pop("cloned_task", None)
             st.session_state["show_new_form"] = False
             st.rerun()
 
+# --------------- HISTÓRICO DE ATIVIDADES ---------------
+if st.session_state.get("show_history"):
+    st.markdown("## 📋 Histórico de Atividades")
+    
+    # Filtros
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("Data inicial", value=datetime.now() - timedelta(days=30))
+    with col2:
+        end_date = st.date_input("Data final", value=datetime.now())
+
+    # Carregar histórico
+    res = supabase.table("task_history").select("*")\
+        .gte("completed_at", str(start_date))\
+        .lte("completed_at", str(end_date))\
+        .order("completed_at", desc=True).execute()
+    history = res.data or []
+
+    if not history:
+        st.info("Nenhuma atividade encontrada no período.")
+    else:
+        for h in history:
+            with st.expander(f"✅ {h['title']} — {get_technician_name(h['technician_id'], load_technicians())} ({h['completed_at'][:10]})"):
+                st.write(f"**Técnico:** {get_technician_name(h['technician_id'], load_technicians())}")
+                st.write(f"**Local:** {get_location_name(h['location_id'], load_locations())} → {h['environment_name']}")
+                st.write(f"**Agendado para:** {h['due_date'][:16].replace('T', ' ')}")
+                st.write(f"**Concluído em:** {h['completed_at'][:16].replace('T', ' ')}")
+                st.write(f"**Recorrência:** {h.get('recurrence', '—')}")
+
+                if h.get("checklist"):
+                    st.write("**Checklist:**")
+                    for item in h["checklist"]:
+                        mark = "✅" if item["is_completed"] else "🔲"
+                        st.write(f"{mark} {item['item']}")
+                else:
+                    st.caption("_Sem checklist_")
+
+                if h.get("notes"):
+                    st.write(f"📝 Observações: {h['notes']}")
+
+    if st.button("Voltar"):
+        st.session_state["show_history"] = False
+        st.rerun()
+
 # --------------- QUADRO KANBAN COM CHECKLIST OTIMIZADO ---------------
-else:
+elif not st.session_state.get("show_history"):
     st.markdown("## 📋 Quadro de Atividades")
 
     techs = load_technicians()
@@ -419,7 +561,9 @@ else:
                     except Exception as e:
                         st.error(f"Erro ao criar tarefa recorrente: {str(e)}")
 
+                # Botões
                 col1, col2, col3, col4 = st.columns(4)
+                
                 if task["status"] in ["scheduled", "overdue"]:
                     with col1:
                         if st.button("▶️ Iniciar", key=f"btn_start_{task['id']}", use_container_width=True):
@@ -429,8 +573,12 @@ else:
                     with col1:
                         if st.button("✅ Concluir", key=f"btn_done_{task['id']}", use_container_width=True):
                             supabase.table("maintenance_tasks").update({"status": "completed"}).eq("id", task["id"]).execute()
+                            # 🔁 Arquivar antes de criar recorrência
+                            checklist_items = [{"text": item["item"], "is_completed": item["is_completed"]} for item in checklist_data]
+                            archive_task(task, checklist_items)
                             create_recurring_task(task)
                             st.rerun()
+
                 with col2:
                     if is_editing:
                         if st.button("💾 Salvar", key=f"btn_save_{task['id']}", use_container_width=True):
@@ -442,6 +590,9 @@ else:
                             all_done = all(item["is_completed"] for item in current_checklist) if current_checklist else False
                             if all_done and task["status"] != "completed":
                                 supabase.table("maintenance_tasks").update({"status": "completed"}).eq("id", task["id"]).execute()
+                                # 🔁 Arquivar antes de criar recorrência
+                                checklist_items = [{"text": item["item"], "is_completed": item["is_completed"]} for item in current_checklist]
+                                archive_task(task, checklist_items)
                                 create_recurring_task(task)
                             st.session_state[edit_mode_key] = False
                             st.success("✅ Alterações salvas!")
@@ -450,12 +601,43 @@ else:
                         if st.button("✏️ Editar", key=f"btn_edit_{task['id']}", use_container_width=True):
                             st.session_state[edit_mode_key] = True
                             st.rerun()
+
                 with col3:
-                    if st.button("🗑️ Excluir", key=f"btn_del_{task['id']}", use_container_width=True):
-                        supabase.table("checklists").delete().eq("task_id", task["id"]).execute()
-                        supabase.table("maintenance_tasks").delete().eq("id", task["id"]).execute()
+                    # Botão Clonar
+                    if st.button("📋 Clonar", key=f"btn_clone_{task['id']}", use_container_width=True):
+                        st.session_state["cloned_task"] = {
+                            "title": task["title"],
+                            "description": task.get("description"),
+                            "specialty": task.get("specialty"),
+                            "technician_id": task.get("technician_id"),
+                            "location_id": None,
+                            "environment_id": None,
+                            "checklist_input": "\n".join([item["item"] for item in checklist_data]),
+                            "recurrence": task.get("recurrence")
+                        }
+                        st.session_state["show_new_form"] = True
                         st.rerun()
+
                 with col4:
+                    # Botão Salvar como Modelo
+                    if st.button("💾 Modelo", key=f"btn_model_{task['id']}", use_container_width=True):
+                        try:
+                            checklist_items = [item["item"] for item in checklist_data]
+                            supabase.table("templates").insert({
+                                "title": task["title"],
+                                "description": task.get("description"),
+                                "specialty": task.get("specialty"),
+                                "technician_id": task.get("technician_id"),
+                                "location_id": task.get("location_id"),
+                                "environment_id": task.get("environment_id"),
+                                "checklist": checklist_items,
+                                "recurrence": task.get("recurrence")
+                            }).execute()
+                            st.success("✅ Salvo como modelo!")
+                        except Exception as e:
+                            st.error(f"Erro ao salvar modelo: {str(e)}")
+
+                    # Botão PDF
                     technician_name = get_technician_name(task['technician_id'], techs)
                     location_name = get_location_name(task['location_id'], locs)
                     environment_name = task.get('environment_id', '—')  # 🔥 Agora exibe nome do ambiente
@@ -525,13 +707,29 @@ else:
                             mark = "✅" if item["is_completed"] else "🔲"
                             st.markdown(f"{mark} {item['item']}")
 
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     if st.button("🗑️ Excluir", key=f"btn_del_done_{task['id']}", use_container_width=True):
                         supabase.table("checklists").delete().eq("task_id", task["id"]).execute()
                         supabase.table("maintenance_tasks").delete().eq("id", task["id"]).execute()
                         st.rerun()
                 with col2:
+                    # Botão Clonar
+                    if st.button("📋 Clonar", key=f"btn_clone_done_{task['id']}", use_container_width=True):
+                        st.session_state["cloned_task"] = {
+                            "title": task["title"],
+                            "description": task.get("description"),
+                            "specialty": task.get("specialty"),
+                            "technician_id": task.get("technician_id"),
+                            "location_id": None,
+                            "environment_id": None,
+                            "checklist_input": "\n".join([item["item"] for item in checklist_data]),
+                            "recurrence": task.get("recurrence")
+                        }
+                        st.session_state["show_new_form"] = True
+                        st.rerun()
+                with col3:
+                    # Botão PDF
                     technician_name = get_technician_name(task['technician_id'], techs)
                     location_name = get_location_name(task['location_id'], locs)
                     environment_name = task.get('environment_id', '—')  # 🔥 Exibe nome do ambiente
