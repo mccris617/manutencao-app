@@ -4,3 +4,5 @@ python-dotenv
 fpdf2
 streamlit-drawable-canvas
 streamlit-calendar
+Pillow
+requests

@@ -17,6 +17,11 @@ if "selected_task" not in st.session_state:
     st.session_state["selected_task"] = None
 if "view_mode" not in st.session_state:
     st.session_state["view_mode"] = "kanban"
+# 🔁 CLONE: Novo estado para controle do clone
+if "show_clone_form" not in st.session_state:
+    st.session_state["show_clone_form"] = False
+if "clone_data" not in st.session_state:
+    st.session_state["clone_data"] = {}
 
 status_labels = {
     "scheduled": "📅 Agendada",
@@ -73,10 +78,6 @@ def get_specialties_list():
     specialties = {r["specialty"] for r in res.data if r.get("specialty")}
     return sorted(specialties) if specialties else ["Refrigeração", "Elétrica", "Hidráulica", "Mecânica"]
 
-def load_templates():
-    res = supabase.table("templates").select("*").execute()
-    return res.data if res.data else []
-
 def load_checklist(task_id):
     res = supabase.table("checklists").select("*").eq("task_id", task_id).execute()
     return [{"id": item["id"], "item": item["item"], "is_completed": item["is_completed"]} for item in res.data] if res.data else []
@@ -94,8 +95,12 @@ def get_next_due_date(due_date, recurrence):
             return due_date.replace(month=due_date.month + 1)
     return None
 
-# ----------- Função: Gerar PDF (estilo limpo e profissional - sem Unicode) -----------
+# ----------- Função: Gerar PDF (com miniaturas de imagens do Storage) -----------
 def generate_pdf(task, technician_name, location_name, checklist_items):
+    import tempfile
+    import requests
+    from PIL import Image as PILImage
+
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -156,7 +161,6 @@ def generate_pdf(task, technician_name, location_name, checklist_items):
         pdf.ln(2)
         for i, item in enumerate(checklist_items):
             pdf.set_font("Arial", "", 10)
-            # Substituído ○ por O e ✔ por X
             mark = "X" if item["checked"] else "O"
             text = f"{i+1}. {item['text']}"
             pdf.multi_cell(0, 6, f"({mark}) {text}")
@@ -166,19 +170,57 @@ def generate_pdf(task, technician_name, location_name, checklist_items):
 
     pdf.ln(8)
 
-    # --- Anexos (se houver) ---
+    # --- Imagens Anexadas ---
     try:
         files = supabase.storage.from_("task-attachments").list(f"{task['id']}/")
         if files:
             pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 8, "ANEXOS", ln=True)
-            pdf.ln(3)
+            pdf.cell(0, 8, "IMAGENS ANEXADAS", ln=True)
+            pdf.ln(5)
             for file in files:
-                pdf.set_font("Arial", "", 10)
-                pdf.cell(0, 6, f"📎 {file['name']}", ln=True)
+                if file['name'].lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                    # Baixar imagem temporariamente
+                    image_url = supabase.storage.from_("task-attachments").get_public_url(f"{task['id']}/{file['name']}")
+                    response = requests.get(image_url)
+                    if response.status_code == 200:
+                        img_data = response.content
+                        # Salvar em arquivo temporário
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
+                            tmp_img.write(img_data)
+                            temp_path = tmp_img.name
+
+                        # Abrir imagem com PIL para redimensionar
+                        pil_img = PILImage.open(temp_path)
+                        # Converter para RGB se necessário (evita erro com RGBA ou CMYK)
+                        if pil_img.mode in ("RGBA", "LA", "P"):
+                            pil_img = pil_img.convert("RGB")
+                        # Redimensionar para miniatura (ex: 100x100)
+                        pil_img.thumbnail((100, 100))
+
+                        # Salvar miniatura em novo arquivo temporário
+                        thumb_path = temp_path + "_thumb.jpg"
+                        pil_img.save(thumb_path, "JPEG")
+
+                        # Adicionar miniatura ao PDF
+                        pdf.image(thumb_path, w=30, h=30)
+                        # Legenda
+                        pdf.set_font("Arial", "", 8)
+                        pdf.cell(30, 5, file['name'][:20] + "...", ln=True, align="C")
+                        pdf.ln(5)
+
+                        # Apagar arquivos temporários
+                        import os
+                        os.unlink(temp_path)
+                        os.unlink(thumb_path)
+                else:
+                    # Se não for imagem, apenas liste o nome
+                    pdf.set_font("Arial", "", 10)
+                    pdf.cell(0, 6, f"[ARQ] {file['name']}", ln=True)  # ← SUBSTITUIU EMOJI POR [ARQ]
             pdf.ln(10)
     except Exception as e:
-        pass  # Falha ao carregar anexos
+        pdf.set_font("Arial", "", 10)
+        pdf.cell(0, 6, f"[Falha ao carregar imagens: {str(e)}]", ln=True)
+        pdf.ln(10)
 
     # --- Rodapé ---
     pdf.set_font("Arial", "I", 9)
@@ -186,6 +228,60 @@ def generate_pdf(task, technician_name, location_name, checklist_items):
     pdf.cell(0, 8, f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')} | Sistema de Manutenção Preventiva", ln=True, align="C")
 
     return bytes(pdf.output(dest='S'))
+
+# ----------- Função: Arquivar tarefa ao concluir -----------
+def archive_task(task, checklist_items):
+    try:
+        supabase.table("task_history").insert({
+            "task_id": task["id"],
+            "title": task["title"],
+            "description": task.get("description"),
+            "specialty": task.get("specialty"),
+            "technician_id": task.get("technician_id"),
+            "location_id": task.get("location_id"),
+            "due_date": task["due_date"],
+            "completed_at": datetime.now().isoformat(),
+            "checklist": [{"item": i["text"], "is_completed": i["checked"]} for i in checklist_items],
+            "recurrence": task.get("recurrence"),
+            "created_from_template": task.get("is_template", False),
+            "notes": task.get("notes", "")
+        }).execute()
+    except Exception as e:
+        st.error(f"Erro ao arquivar: {str(e)}")
+
+# ----------- Função: Criar tarefa recorrente -----------
+def create_recurring_task(original_task):
+    recurrence = original_task.get("recurrence")
+    if not recurrence:
+        return
+    try:
+        current_due = datetime.fromisoformat(original_task["due_date"])
+        next_due = get_next_due_date(current_due, recurrence)
+        if next_due:
+            res = supabase.table("maintenance_tasks").insert({
+                "title": original_task["title"],
+                "description": original_task.get("description"),
+                "specialty": original_task.get("specialty"),
+                "technician_id": original_task.get("technician_id"),
+                "location_id": original_task.get("location_id"),
+                "due_date": next_due.isoformat(),
+                "recurrence": recurrence,
+                "status": "scheduled",
+                "is_template": False,
+                "notes": original_task.get("notes")
+            }).execute()
+            new_task_id = res.data[0]["id"] if res.data else None
+            checklist_data = load_checklist(original_task["id"])
+            if checklist_data:
+                for item in checklist_data:
+                    supabase.table("checklists").insert({
+                        "task_id": new_task_id,
+                        "item": item["item"],
+                        "is_completed": False
+                    }).execute()
+    except Exception as e:
+        st.error(f"Erro ao criar tarefa recorrente: {str(e)}")
+
 # ----------- Função: Excluir tarefas em massa -----------
 def delete_tasks_in_bulk(task_ids):
     try:
@@ -204,16 +300,6 @@ def delete_tasks_in_bulk(task_ids):
 # ----------- Página Principal -----------
 st.set_page_config(page_title="🔧 Manutenção Preventiva", layout="wide")
 st.title("🔧 Sistema de Manutenção Preventiva")
-
-# Verificação de fontes (opcional)
-base_dir = os.path.dirname(__file__)
-required_fonts = ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf"]
-missing = [f for f in required_fonts if not os.path.exists(os.path.join(base_dir, f))]
-if missing:
-    # st.sidebar.error(f"⚠️ Fontes ausentes: {', '.join(missing)}")
-    pass  # Apenas ignora se não encontrar as fontes
-else:
-    st.sidebar.success("✅ Fontes OK")
 
 # --- Sidebar: Cadastros ---
 with st.sidebar:
@@ -242,32 +328,6 @@ with st.sidebar:
                     supabase.table("locations").insert({"name": loc_name}).execute()
                     st.success("✅ Localidade salva!")
                     st.rerun()
-
-    # --- Modelos ---
-    st.header("📂 Modelos")
-    templates = load_templates()
-    if templates:
-        selected_template = st.selectbox(
-            "Usar modelo",
-            options=[t["id"] for t in templates],
-            format_func=lambda x: next(t["title"] for t in templates if t["id"] == x)
-        )
-        if st.button("➕ Criar com Modelo"):
-            template = next(t for t in templates if t["id"] == selected_template)
-            st.session_state["cloned_task"] = {
-                "title": template["title"],
-                "description": template["description"],
-                "specialty": template["specialty"],
-                "technician_id": template["technician_id"],
-                "location_id": template["location_id"],
-                "checklist_input": "\n".join(template.get("checklist", [])),
-                "recurrence": template.get("recurrence"),
-                "notes": template.get("notes", "")  # 🔥 Copia observações do modelo
-            }
-            st.session_state["show_new_form"] = True
-            st.rerun()
-    else:
-        st.info("Nenhum modelo salvo.")
 
     # --- Histórico ---
     if st.button("📋 Histórico"):
@@ -323,7 +383,8 @@ if st.session_state.get("show_new_form"):
         if use_multiple_locs:
             selected_locs = st.multiselect("Selecione as localidades", options=list(locs.keys()), format_func=lambda x: locs[x])
         due_date = st.date_input("Data de Agendamento *", value=datetime.now())
-        priority = st.selectbox("Prioridade", ["Baixa", "Média", "Alta"], index=2)  # Padrão: Alta
+        # Substituído por prioridade
+        priority = st.selectbox("Prioridade", ["Baixa", "Média", "Alta"], index=2)
         recurrence_map_inv = {None: "Nenhuma", "daily": "Diária", "weekly": "Semanal", "monthly": "Mensal"}
         current_recurrence = cloned.get("recurrence", "Nenhuma")
         rec_index = ["Nenhuma", "Diária", "Semanal", "Mensal"].index(current_recurrence) if current_recurrence in ["Nenhuma", "Diária", "Semanal", "Mensal"] else 0
@@ -344,7 +405,7 @@ if st.session_state.get("show_new_form"):
             if not title or (not loc_id and not use_multiple_locs):
                 st.error("Título e localidade são obrigatórios.")
             else:
-                due_dt = datetime.combine(due_date, due_time)
+                due_dt = datetime.combine(due_date, datetime.now().time())
                 status = "scheduled" if due_dt >= datetime.now() else "overdue"
                 recurrence_map = {"Nenhuma": None, "Diária": "daily", "Semanal": "weekly", "Mensal": "monthly"}
                 if use_multiple_locs and selected_locs:
@@ -356,12 +417,12 @@ if st.session_state.get("show_new_form"):
                             "specialty": specialty,
                             "technician_id": tech_id,
                             "location_id": str(loc_id_single),
-                            "due_date": datetime.combine(due_date, datetime.now().time()).isoformat(),
-                            "priority": priority,
+                            "due_date": due_dt.isoformat(),
                             "recurrence": recurrence_map[recurrence],
                             "status": status,
                             "is_template": False,
-                            "notes": notes_input  # 🔥 Salva observações
+                            "notes": notes_input,
+                            "priority": priority
                         }).execute()
                         task_id = res.data[0]["id"] if res.data else None
                         if checklist_input and task_id:
@@ -381,12 +442,12 @@ if st.session_state.get("show_new_form"):
                         "specialty": specialty,
                         "technician_id": tech_id,
                         "location_id": str(loc_id),
-                        "due_date": datetime.combine(due_date, datetime.now().time()).isoformat(),
-                        "priority": priority,
+                        "due_date": due_dt.isoformat(),
                         "recurrence": recurrence_map[recurrence],
                         "status": status,
                         "is_template": False,
-                        "notes": notes_input  # 🔥 Salva observações
+                        "notes": notes_input,
+                        "priority": priority
                     }).execute()
                     task_id = res.data[0]["id"] if res.data else None
                     if checklist_input and task_id:
@@ -408,7 +469,87 @@ if st.session_state.get("show_new_form"):
             st.session_state["show_new_form"] = False
             st.rerun()
 
-# --------------- DETALHE DA ATIVIDADE EM MODAL ---------------
+# --------------- FORMULÁRIO: Clonar Atividade (com múltiplas localidades) ---------------
+if st.session_state.get("show_clone_form"):
+    cloning_data = st.session_state["clone_data"]
+    original_task = cloning_data["original_task"]
+    checklist_data = cloning_data["checklist"]
+
+    st.markdown("### 📋 Clonar Atividade")
+    with st.form("form_clone_task"):
+        title = st.text_input("Título", value=original_task["title"])
+        description = st.text_area("Descrição", value=original_task.get("description", ""))
+        specialty = st.selectbox("Especialidade", get_specialties_list() + ["Outra"], index=get_specialties_list().index(original_task.get("specialty")) if original_task.get("specialty") in get_specialties_list() else 0)
+        if specialty == "Outra":
+            specialty = st.text_input("Nova especialidade", value=original_task.get("specialty", ""))
+
+        techs = load_technicians()
+        default_tech_idx = list(techs.keys()).index(original_task["technician_id"]) + 1 if original_task["technician_id"] in techs else 0
+        tech_id = st.selectbox("Técnico", options=[None] + list(techs.keys()), format_func=lambda x: techs[x]["name"] if x else "—", index=default_tech_idx)
+
+        due_date = st.date_input("Data de Agendamento", value=datetime.fromisoformat(original_task["due_date"][:10]))
+        priority = st.selectbox("Prioridade", ["Baixa", "Média", "Alta"], index=["Baixa", "Média", "Alta"].index(original_task.get("priority", "Alta")))
+
+        recurrence_map_inv = {None: "Nenhuma", "daily": "Diária", "weekly": "Semanal", "monthly": "Mensal"}
+        current_recurrence = original_task.get("recurrence", "Nenhuma")
+        rec_index = ["Nenhuma", "Diária", "Semanal", "Mensal"].index(current_recurrence) if current_recurrence in ["Nenhuma", "Diária", "Semanal", "Mensal"] else 0
+        recurrence = st.selectbox("Recorrência", ["Nenhuma", "Diária", "Semanal", "Mensal"], index=rec_index)
+
+        checklist_items = [item["item"] for item in checklist_data]
+        checklist_str = "\n".join(checklist_items)
+        checklist_input = st.text_area("Checklist (um item por linha)", value=checklist_str, help="Pode editar os itens do checklist original")
+
+        notes_input = st.text_area("Observações Técnicas", value=original_task.get("notes", ""), help="Informações adicionais sobre a tarefa")
+
+        locs = load_locations()
+        selected_locs = st.multiselect("Selecione as localidades de destino", options=list(locs.keys()), format_func=lambda x: locs[x])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            submit = st.form_submit_button("✅ Clonar")
+        with col2:
+            cancel = st.form_submit_button("Cancelar")
+
+        if submit:
+            if not title or not selected_locs:
+                st.error("Título e localidades são obrigatórios.")
+            else:
+                due_dt = datetime.combine(due_date, datetime.now().time())
+                status = "scheduled" if due_dt >= datetime.now() else "overdue"
+                recurrence_map = {"Nenhuma": None, "Diária": "daily", "Semanal": "weekly", "Mensal": "monthly"}
+
+                for loc_id_single in selected_locs:
+                    res = supabase.table("maintenance_tasks").insert({
+                        "title": title,
+                        "description": description,
+                        "specialty": specialty,
+                        "technician_id": tech_id,
+                        "location_id": str(loc_id_single),
+                        "due_date": due_dt.isoformat(),
+                        "recurrence": recurrence_map[recurrence],
+                        "status": status,
+                        "is_template": False,
+                        "notes": notes_input,
+                        "priority": priority
+                    }).execute()
+                    task_id = res.data[0]["id"] if res.data else None
+                    if checklist_input and task_id:
+                        items = [line.strip() for line in checklist_input.split("\n") if line.strip()]
+                        for item in items:
+                            supabase.table("checklists").insert({
+                                "task_id": task_id,
+                                "item": item,
+                                "is_completed": False
+                            }).execute()
+                st.success(f"✅ {len(selected_locs)} tarefa(s) clonada(s) com sucesso!")
+                st.session_state["show_clone_form"] = False
+                st.rerun()
+
+        if cancel:
+            st.session_state["show_clone_form"] = False
+            st.rerun()
+
+# --------------- DETALHE DA ATIVIDADE EM MODAL (atualizado para upload de mídia) ---------------
 def show_task_modal(task):
     techs = load_technicians()
     locs = load_locations()
@@ -419,7 +560,7 @@ def show_task_modal(task):
         st.markdown(f"**Descrição:** {task.get('description', '—')}")
         st.markdown(f"**Especialidade:** {task.get('specialty', '—')}")
         st.markdown(f"**Técnico:** {tech_name}")
-        st.markdown(f"**Localidade:** 📍 `{loc_name}`")  # 🔥 Destaque
+        st.markdown(f"**Localidade:** 📍 `{loc_name}`")
         due = task['due_date'][:16].replace('T', ' ')
         st.markdown(f"**Agendado para:** {due}")
         st.markdown(f"**Status:** {status_labels.get(task['status'], task['status'])}")
@@ -456,6 +597,8 @@ def show_task_modal(task):
         st.markdown("### 📝 Observações Técnicas")
         note_key = f"note_{task['id']}"
         if note_key not in st.session_state:
+            # Carrega observação do banco (simulado como não existente, pois não temos login)
+            # Supondo que o campo 'notes' exista na tabela
             res = supabase.table("maintenance_tasks").select("notes").eq("id", task["id"]).execute()
             current_note = res.data[0]["notes"] if res.data and res.data[0].get("notes") else ""
             st.session_state[note_key] = current_note
@@ -467,42 +610,51 @@ def show_task_modal(task):
         )
         st.session_state[note_key] = observation  # Atualiza em tempo real
 
-        # Upload de imagem
+        # Upload de Múltiplas Imagens e Vídeos
         st.markdown("### 📎 Anexos")
-        uploaded_file = st.file_uploader("Anexar imagem", type=["png", "jpg", "jpeg"], key=f"upload_{task['id']}")
-        if uploaded_file:
-            try:
-                supabase.storage.from_("task-attachments").upload(
-                    f"{task['id']}/{uploaded_file.name}",
-                    uploaded_file.getvalue(),
-                    file_options={"content-type": uploaded_file.type}
-                )
-                st.success("✅ Imagem anexada!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao enviar: {str(e)}")
+        uploaded_files = st.file_uploader(
+            "Anexar fotos e vídeos",
+            type=["png", "jpg", "jpeg", "webp", "mp4", "mov", "avi", "mkv"],
+            accept_multiple_files=True,
+            key=f"upload_{task['id']}"
+        )
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                try:
+                    # Gera nome único para evitar conflitos
+                    file_ext = uploaded_file.name.split(".")[-1]
+                    file_unique_name = f"{task['id']}/{uploaded_file.name}"
+                    supabase.storage.from_("task-attachments").upload(
+                        file_unique_name,
+                        uploaded_file.getvalue(),
+                        file_options={"content-type": uploaded_file.type}
+                    )
+                    st.success(f"✅ {uploaded_file.name} anexado!")
+                except Exception as e:
+                    st.error(f"Erro ao enviar {uploaded_file.name}: {str(e)}")
 
-        # Anexos existentes
+        # Mostrar Arquivos Anexados
         try:
             files = supabase.storage.from_("task-attachments").list(f"{task['id']}/")
             if files:
-                cols_img = st.columns(3)
+                st.markdown("#### 🖼️ Mídias Anexadas:")
+                cols_media = st.columns(3)
                 for idx, file in enumerate(files):
                     url = supabase.storage.from_("task-attachments").get_public_url(f"{task['id']}/{file['name']}")
-                    with cols_img[idx % 3]:
-                        st.image(url, width=200, caption=file["name"])
+                    with cols_media[idx % 3]:
+                        if file['name'].lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                            st.image(url, caption=file["name"], use_column_width=True)
+                        elif file['name'].lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                            st.video(url, format="video/mp4")
+                        else:
+                            st.caption(f"📎 [{file['name']}]({url})")
             else:
-                st.caption("_Nenhum anexo_")
-        except:
-            st.caption("_Falha ao carregar anexos_")
-
-        # Assinatura
-        signature_url = task.get("signature_url")
-        if signature_url:
-            st.image(signature_url, caption="Assinatura do técnico", width=300)
+                st.caption("_Nenhuma mídia anexada._")
+        except Exception as e:
+            st.caption(f"_Falha ao carregar mídias: {str(e)}_")
 
         # Botões
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             if task["status"] in ["scheduled", "overdue"]:
                 if st.button("▶️ Iniciar", use_container_width=True):
@@ -532,13 +684,14 @@ def show_task_modal(task):
         with col2:
             if st.button("📋 Clonar", use_container_width=True):
                 locations = load_locations()
-                with st.expander("Clonar para múltiplas localidades", expanded=True):
+                with st.expander(f"Clonar para múltiplas localidades", expanded=True):
                     selected_locations = st.multiselect(
                         "Selecione as localidades",
                         options=list(locations.keys()),
-                        format_func=lambda x: locations[x]
+                        format_func=lambda x: locations[x],
+                        key=f"multi_loc_{task['id']}"
                     )
-                    if st.button("Clonar para selecionadas", use_container_width=True):
+                    if st.button("Clonar para selecionadas", key=f"do_clone_{task['id']}", use_container_width=True):
                         checklist_data = load_checklist(task["id"])
                         if selected_locations:
                             for loc_id in selected_locations:
@@ -552,7 +705,7 @@ def show_task_modal(task):
                                     "recurrence": task.get("recurrence"),
                                     "status": "scheduled",
                                     "is_template": False,
-                                    "notes": task.get("notes")  # 🔥 Copia observações
+                                    "notes": task.get("notes", "")  # 🔥 Copia observações
                                 }).execute()
                                 new_task_id = res.data[0]["id"] if res.data else None
                                 if checklist_data and new_task_id:
@@ -567,28 +720,18 @@ def show_task_modal(task):
                         else:
                             st.warning("Selecione pelo menos uma localidade.")
         with col3:
-            if st.button("📄 PDF", use_container_width=True):
-                try:
-                    checklist_items = [{"text": item["item"], "checked": item["is_completed"]} for item in checklist_data]
-                    pdf_bytes = generate_pdf(task, get_technician_name(task['technician_id'], techs), get_location_name(task['location_id'], locs), checklist_items)
-                    st.download_button(
-                        "📥 Baixar PDF",
-                        data=pdf_bytes,
-                        file_name=f"atividade_{task['id']}.pdf",
-                        mime="application/pdf",
-                        key=f"download_pdf_modal_{task['id']}",
-                        use_container_width=True
-                    )
-                except Exception as e:
-                    st.error(f"Erro ao gerar PDF: {str(e)}")
-        with col4:
             if st.button("🗑️ Excluir", use_container_width=True):
                 supabase.table("checklists").delete().eq("task_id", task["id"]).execute()
                 supabase.table("maintenance_tasks").delete().eq("id", task["id"]).execute()
+                # Apaga arquivos do storage (opcional)
+                try:
+                    supabase.storage.from_("task-attachments").remove([f"{task['id']}/{f['name']}" for f in files])
+                except:
+                    pass  # Não faz nada se não houver arquivos
                 st.success("✅ Tarefa excluída!")
                 st.session_state["selected_task"] = None
                 st.rerun()
-        with col5:
+        with col4:
             if st.button("← Voltar", use_container_width=True):
                 st.session_state["selected_task"] = None
                 st.rerun()
@@ -623,75 +766,76 @@ else:
     tasks_all = get_filtered_tasks(["scheduled", "in_progress", "completed", "overdue"])
 
     # Modo: Lista
-    if st.session_state["view_mode"] == "list":
-        st.subheader("📋 Visão em Lista")
-        # Menu ⋯ para ações em massa
-        col_menu, col_counter = st.columns([4, 1])
-        with col_menu:
-            bulk_key = "bulk_list_active"
-            select_key = "bulk_selected_list"
-            if bulk_key not in st.session_state:
-                st.session_state[bulk_key] = False
-            if select_key not in st.session_state:
-                st.session_state[select_key] = []
-            if st.button("⋮", help="Menu de ações", key="menu_bulk_list"):
-                st.session_state[bulk_key] = not st.session_state[bulk_key]
+if st.session_state["view_mode"] == "list":
+    st.subheader("📋 Visão em Lista")
+    # Menu ⋯ para ações em massa
+    col_menu, col_counter = st.columns([4, 1])
+    with col_menu:
+        bulk_key = "bulk_list_active"
+        select_key = "bulk_selected_list"
+        if bulk_key not in st.session_state:
+            st.session_state[bulk_key] = False
+        if select_key not in st.session_state:
+            st.session_state[select_key] = []
+        if st.button("⋮", help="Menu de ações", key="menu_bulk_list"):
+            st.session_state[bulk_key] = not st.session_state[bulk_key]
+            st.rerun()
+        if st.session_state[bulk_key]:
+            if st.button("🗑️ Selecionar para excluir", key="enable_bulk_list", use_container_width=True):
+                st.session_state[bulk_key] = True
                 st.rerun()
-            if st.session_state[bulk_key]:
-                if st.button("🗑️ Selecionar para excluir", key="enable_bulk_list", use_container_width=True):
-                    st.session_state[bulk_key] = True
-                    st.rerun()
-                if st.session_state[select_key]:
-                    count = len(st.session_state[select_key])
-                    if st.button(f"🗑️ Excluir {count} tarefa(s)", type="secondary", use_container_width=True):
-                        delete_tasks_in_bulk(st.session_state[select_key])
-                        st.session_state[select_key] = []
-                        st.rerun()
-        with col_counter:
             if st.session_state[select_key]:
-                st.caption(f"🟢 {len(st.session_state[select_key])} selecionada(s)")
-        for task in tasks_all:
-            # 🔥 Card com sombra e borda
-            with st.container(border=True):
-                col1, col2, col3, col4, col5, col6 = st.columns([1, 4, 2, 1, 1, 1])
-                with col1:
-                    if st.session_state.get(bulk_key, False):
-                        key = f"bulk_list_{task['id']}"
-                        is_selected = st.checkbox("", value=task["id"] in st.session_state[select_key], key=key)
-                        if is_selected and task["id"] not in st.session_state[select_key]:
-                            st.session_state[select_key].append(task["id"])
-                        elif not is_selected and task["id"] in st.session_state[select_key]:
-                            st.session_state[select_key].remove(task["id"])
-                with col2:
-                    st.markdown(f"**{task['title']}**")
-                    st.caption(f"📍 {get_location_name(task['location_id'], locs)}")
-                with col3:
-                    st.write(status_labels.get(task["status"]))
-                with col4:
-                    if st.button("🔍", key=f"open_{task['id']}"):
-                        st.session_state["selected_task"] = task
-                        st.rerun()
-                with col5:
-                    checklist_data = load_checklist(task["id"])
-                    checklist_items = [{"text": item["item"], "checked": item["is_completed"]} for item in checklist_data]
-                    if st.button("📄", key=f"pdf_list_{task['id']}", help="Imprimir"):
-                        try:
-                            pdf_bytes = generate_pdf(task, get_technician_name(task['technician_id'], techs), get_location_name(task['location_id'], locs), checklist_items)
-                            st.download_button(
-                                "📥",
-                                data=pdf_bytes,
-                                file_name=f"atividade_{task['id']}.pdf",
-                                mime="application/pdf",
-                                key=f"download_pdf_list_{task['id']}",
-                                use_container_width=True
-                            )
-                        except Exception as e:
-                            st.error(f"Erro ao gerar PDF: {str(e)}")
-                with col6:
-                    st.markdown(f"<small>{task['due_date'][:16].replace('T', ' ')}</small>", unsafe_allow_html=True)
+                count = len(st.session_state[select_key])
+                if st.button(f"🗑️ Excluir {count} tarefa(s)", type="secondary", use_container_width=True):
+                    delete_tasks_in_bulk(st.session_state[select_key])
+                    st.session_state[select_key] = []
+                    st.rerun()
+    with col_counter:
+        if st.session_state[select_key]:
+            st.caption(f"🟢 {len(st.session_state[select_key])} selecionada(s)")
+    for task in tasks_all:
+        # 🔥 Card com sombra e borda
+        with st.container(border=True):
+            col1, col2, col3, col4, col5, col6 = st.columns([1, 3, 2, 1, 1, 1])
+            with col1:
+                if st.session_state.get(bulk_key, False):
+                    key = f"bulk_list_{task['id']}"
+                    is_selected = st.checkbox("", value=task["id"] in st.session_state[select_key], key=key)
+                    if is_selected and task["id"] not in st.session_state[select_key]:
+                        st.session_state[select_key].append(task["id"])
+                    elif not is_selected and task["id"] in st.session_state[select_key]:
+                        st.session_state[select_key].remove(task["id"])
+            with col2:
+                st.markdown(f"**{task['title']}**")
+                st.caption(f"📍 {get_location_name(task['location_id'], locs)}")
+            with col3:
+                st.write(status_labels.get(task["status"]))
+            with col4:
+                if st.button("🔍", key=f"open_{task['id']}"):
+                    st.session_state["selected_task"] = task
+                    st.rerun()
+            with col5:
+                # Botão PDF
+                checklist_data = load_checklist(task["id"])
+                checklist_items = [{"text": item["item"], "checked": item["is_completed"]} for item in checklist_data]
+                if st.button("📄", key=f"pdf_list_{task['id']}", help="Gerar PDF"):
+                    try:
+                        pdf_bytes = generate_pdf(task, get_technician_name(task['technician_id'], techs), get_location_name(task['location_id'], locs), checklist_items)
+                        st.download_button(
+                            label="📥",
+                            data=pdf_bytes,
+                            file_name=f"atividade_{task['id']}.pdf",
+                            mime="application/pdf",
+                            key=f"download_pdf_list_{task['id']}",
+                            use_container_width=True
+                        )
+                    except Exception as e:
+                        st.error(f"Erro ao gerar PDF: {str(e)}")
+            with col6:
+                st.markdown(f"<small>{task['due_date'][:16].replace('T', ' ')}</small>", unsafe_allow_html=True)
 
     # Modo: Kanban
-    elif st.session_state["view_mode"] == "kanban":
+elif st.session_state["view_mode"] == "kanban":
         st.subheader("📊 Quadro Kanban")
         # Menu ⋯ para ações em massa
         col_menu, col_counter = st.columns([4, 1])
@@ -746,7 +890,7 @@ else:
                         )
                         st.markdown(f"**Especialidade:** `{task.get('specialty', '—')}`")
                         st.markdown(f"**Técnico:** {get_technician_name(task['technician_id'], techs)}")
-                        st.markdown(f"**Local:** 📍 `{get_location_name(task['location_id'], locs)}`")  # 🔥 Destaque
+                        st.markdown(f"**Local:** 📍 `{get_location_name(task['location_id'], locs)}`")
                         due = task['due_date'][:16].replace('T', ' ')
                         st.markdown(f"**Agendado para:** {due}")
 
@@ -774,7 +918,7 @@ else:
                                 st.caption(f"*{task['notes']}*")
 
                         # Botões
-                        col1, col2, col3, col4, col5 = st.columns(5)
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             if task["status"] in ["scheduled", "overdue"]:
                                 if st.button("▶️ Iniciar", key=f"start_{task['id']}", use_container_width=True):
@@ -789,42 +933,13 @@ else:
                                     st.rerun()
                         with col2:
                             if st.button("📋 Clonar", key=f"clone_{task['id']}", use_container_width=True):
-                                locations = load_locations()
-                                with st.expander(f"Clonar para múltiplas localidades", expanded=True):
-                                    selected_locations = st.multiselect(
-                                        "Selecione as localidades",
-                                        options=list(locations.keys()),
-                                        format_func=lambda x: locations[x],
-                                        key=f"multi_loc_{task['id']}"
-                                    )
-                                    if st.button("Clonar para selecionadas", key=f"do_clone_{task['id']}", use_container_width=True):
-                                        checklist_data = load_checklist(task["id"])
-                                        if selected_locations:
-                                            for loc_id in selected_locations:
-                                                res = supabase.table("maintenance_tasks").insert({
-                                                    "title": task["title"],
-                                                    "description": task.get("description"),
-                                                    "specialty": task.get("specialty"),
-                                                    "technician_id": task.get("technician_id"),
-                                                    "location_id": str(loc_id),
-                                                    "due_date": task["due_date"],
-                                                    "recurrence": task.get("recurrence"),
-                                                    "status": "scheduled",
-                                                    "is_template": False,
-                                                    "notes": task.get("notes")  # 🔥 Copia observações
-                                                }).execute()
-                                                new_task_id = res.data[0]["id"] if res.data else None
-                                                if checklist_data and new_task_id:
-                                                    for item in checklist_data:
-                                                        supabase.table("checklists").insert({
-                                                            "task_id": new_task_id,
-                                                            "item": item["item"],
-                                                            "is_completed": False
-                                                        }).execute()
-                                            st.success(f"✅ {len(selected_locations)} tarefas clonadas!")
-                                            st.rerun()
-                                        else:
-                                            st.warning("Selecione pelo menos uma localidade.")
+                                checklist_data = load_checklist(task["id"])
+                                st.session_state["clone_data"] = {
+                                    "original_task": task,
+                                    "checklist": checklist_data
+                                }
+                                st.session_state["show_clone_form"] = True
+                                st.rerun()
                         with col3:
                             if st.button("📄 PDF", key=f"pdf_{task['id']}", use_container_width=True):
                                 try:
@@ -844,15 +959,9 @@ else:
                             if st.button("🔍 Detalhes", key=f"det_{task['id']}", use_container_width=True):
                                 st.session_state["selected_task"] = task
                                 st.rerun()
-                        with col5:
-                            if st.button("🗑️", key=f"del_{task['id']}", help="Excluir"):
-                                supabase.table("checklists").delete().eq("task_id", task["id"]).execute()
-                                supabase.table("maintenance_tasks").delete().eq("id", task["id"]).execute()
-                                st.success("✅ Tarefa excluída!")
-                                st.rerun()
 
     # Modo: Calendário
-    elif st.session_state["view_mode"] == "calendar":
+elif st.session_state["view_mode"] == "calendar":
         st.subheader("📅 Visão em Calendário")
         events = []
         for task in tasks_all:
