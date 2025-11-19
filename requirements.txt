@@ -6,3 +6,6 @@ streamlit-drawable-canvas
 streamlit-calendar
 Pillow
 requests
+streamlit-extras
+python-dotenv
+pytz
