@@ -45,7 +45,11 @@ def init_session_state():
         "show_tables_manager": False,
         "task_materials_loaded": set(),  # Para controlar quais tarefas já carregaram tabelas
         "active_materials_editor": None,  # Para saber qual tarefa está editando tabelas
-        "last_modified_task": None  # Para restaurar dados após refresh
+        "last_modified_task": None,  # Para restaurar dados após refresh
+        "table_editor_states": {},  # Novo: Estado específico para editor de tabelas
+        "current_editing_table": None,  # Novo: Qual tabela está sendo editada
+        "table_tab_selection": {},  # Novo: Controle de tab selecionada
+        "initialized": True  # Novo: Flag de inicialização
     }
     
     for key, default_value in defaults.items():
@@ -163,10 +167,85 @@ def get_priority_badge(priority):
     priority_info = PRIORITIES_WITH_EMOJIS.get(priority, PRIORITIES_WITH_EMOJIS["media"])
     return f'<span class="priority-badge" style="background-color: {priority_info["color"]}20; color: {priority_info["color"]}; border: 1px solid {priority_info["color"]};">{priority_info["label"]}</span>'
 
+def sanitize_filename(filename):
+    """Sanitiza nome do arquivo"""
+    name, ext = os.path.splitext(filename)
+    name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    unique_id = str(uuid.uuid4())[:8]
+    return f"{name}_{unique_id}{ext}"
+
+def handle_file_upload(task_id, uploaded_file):
+    """Processa upload de arquivo"""
+    try:
+        upload_key = f"{task_id}_{uploaded_file.name}_{uploaded_file.size}"
+        if upload_key in st.session_state.uploaded_files:
+            st.warning("📎 Este arquivo já foi enviado.")
+            return
+        
+        safe_filename = sanitize_filename(uploaded_file.name)
+        file_path = f"{task_id}/{safe_filename}"
+        
+        supabase.storage.from_("task-attachments").upload(
+            file_path, 
+            uploaded_file.getvalue(), 
+            file_options={"content-type": uploaded_file.type}
+        )
+        
+        st.session_state.uploaded_files[upload_key] = True
+        st.toast("✅ Imagem anexada!", icon="🖼️")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Erro ao enviar: {str(e)}")
+
+def load_attachments(task_id):
+    """Carrega anexos de uma tarefa"""
+    try:
+        return supabase.storage.from_("task-attachments").list(task_id) or []
+    except:
+        return []
+
+def get_attachment_url(task_id, filename):
+    """Obtém URL pública do anexo"""
+    try:
+        return supabase.storage.from_("task-attachments").get_public_url(f"{task_id}/{filename}")
+    except:
+        return None
+
+def is_image_file(filepath):
+    """Verifica se arquivo é imagem"""
+    return filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff'))
+
+def download_attachments_to_temp(task_id, attachments):
+    """Baixa anexos para diretório temporário"""
+    if not attachments:
+        return [], None
+    
+    temp_dir = tempfile.mkdtemp()
+    image_paths = []
+    
+    for att in attachments:
+        if not is_image_file(att['name']):
+            continue
+        
+        try:
+            file_path = f"{task_id}/{att['name']}"
+            file_data = supabase.storage.from_("task-attachments").download(file_path)
+            local_path = os.path.join(temp_dir, att['name'])
+            
+            with open(local_path, 'wb') as f:
+                f.write(file_data)
+            
+            image_paths.append(local_path)
+        except:
+            pass
+    
+    return image_paths, temp_dir
+
 # ----------- GERENCIAMENTO DE TABELAS DE MATERIAIS -----------
 
 def load_task_materials_tables(task_id, force_reload=False):
     """Carrega tabelas de materiais de uma tarefa do banco"""
+    # Verificar se já está carregado e não forçar recarga
     if not force_reload and task_id in st.session_state["task_materials_loaded"]:
         return st.session_state["materials_tables"].get(task_id, [])
     
@@ -174,33 +253,62 @@ def load_task_materials_tables(task_id, force_reload=False):
         # Carregar do banco
         res = supabase.table("task_materials").select("*").eq("task_id", task_id).execute()
         
+        tables = []
         if res.data:
-            tables = []
             for table_data in res.data:
                 # Converter JSON string para dicionário
-                data_json = json.loads(table_data["table_data"])
-                tables.append({
-                    "id": table_data["id"],
-                    "name": data_json.get("name", "Tabela de Materiais"),
-                    "rows": len(data_json.get("data", [])),
-                    "cols": len(data_json.get("headers", [])),
-                    "data": data_json.get("data", []),
-                    "headers": data_json.get("headers", ["Material", "Quantidade", "Unidade", "Observações"]),
-                    "has_data": any(
-                        any(cell.strip() for cell in row) 
-                        for row in data_json.get("data", [])
-                    )
-                })
-            
-            st.session_state["materials_tables"][task_id] = tables
-            st.session_state["task_materials_loaded"].add(task_id)
-            return tables
+                try:
+                    data_json = json.loads(table_data["table_data"])
+                    
+                    # Garantir estrutura consistente
+                    if not isinstance(data_json, dict):
+                        data_json = {}
+                    
+                    # Extrair dados com valores padrão
+                    name = data_json.get("name", "Tabela de Materiais")
+                    headers = data_json.get("headers", ["Material", "Quantidade", "Unidade", "Observações"])
+                    data = data_json.get("data", [])
+                    
+                    # Garantir que headers seja uma lista
+                    if not isinstance(headers, list):
+                        headers = ["Material", "Quantidade", "Unidade", "Observações"]
+                    
+                    # Garantir que data seja uma lista de listas
+                    if not isinstance(data, list):
+                        data = []
+                    else:
+                        # Garantir que cada linha seja uma lista
+                        data = [row if isinstance(row, list) else [] for row in data]
+                    
+                    tables.append({
+                        "id": table_data["id"],
+                        "name": name,
+                        "rows": len(data),
+                        "cols": len(headers),
+                        "data": data,
+                        "headers": headers,
+                        "has_data": any(
+                            any(cell.strip() for cell in row) 
+                            for row in data
+                        )
+                    })
+                except Exception as e:
+                    # Se houver erro ao processar, criar tabela padrão
+                    print(f"Erro ao processar tabela: {e}")
+                    tables.append(create_default_table())
         else:
             # Criar tabela padrão se não existir
-            default_tables = [create_default_table()]
-            st.session_state["materials_tables"][task_id] = default_tables
-            st.session_state["task_materials_loaded"].add(task_id)
-            return default_tables
+            tables = [create_default_table()]
+        
+        # Atualizar estado da sessão
+        st.session_state["materials_tables"][task_id] = tables
+        st.session_state["task_materials_loaded"].add(task_id)
+        
+        # Inicializar estado do editor se necessário
+        if task_id not in st.session_state["table_editor_states"]:
+            st.session_state["table_editor_states"][task_id] = {}
+        
+        return tables
             
     except Exception as e:
         st.error(f"Erro ao carregar tabelas de materiais: {str(e)}")
@@ -217,15 +325,17 @@ def save_task_materials_tables(task_id, tables):
         
         # Inserir novas tabelas
         for table in tables:
+            # Garantir estrutura consistente
             table_data = {
-                "task_id": task_id,
-                "table_data": json.dumps({
-                    "name": table["name"],
-                    "headers": table["headers"],
-                    "data": table["data"]
-                }, ensure_ascii=False)
+                "name": table.get("name", "Tabela de Materiais"),
+                "headers": table.get("headers", ["Material", "Quantidade", "Unidade", "Observações"]),
+                "data": table.get("data", [])
             }
-            supabase.table("task_materials").insert(table_data).execute()
+            
+            supabase.table("task_materials").insert({
+                "task_id": task_id,
+                "table_data": json.dumps(table_data, ensure_ascii=False)
+            }).execute()
         
         # Atualizar sessão
         st.session_state["materials_tables"][task_id] = tables
@@ -252,6 +362,307 @@ def create_default_table():
         "has_data": False
     }
 
+def get_table_editor_state(task_id, table_idx):
+    """Obtém o estado do editor para uma tabela específica"""
+    if task_id not in st.session_state["table_editor_states"]:
+        st.session_state["table_editor_states"][task_id] = {}
+    
+    table_key = f"table_{table_idx}"
+    if table_key not in st.session_state["table_editor_states"][task_id]:
+        # Carregar tabela para inicializar estado
+        tables = load_task_materials_tables(task_id)
+        if table_idx < len(tables):
+            table = tables[table_idx]
+            st.session_state["table_editor_states"][task_id][table_key] = {
+                "name": table.get("name", f"Tabela {table_idx + 1}"),
+                "rows": table.get("rows", 3),
+                "cols": table.get("cols", 4),
+                "headers": table.get("headers", ["Material", "Quantidade", "Unidade", "Observações"]).copy(),
+                "data": [row.copy() for row in table.get("data", [])],
+                "has_data": table.get("has_data", False)
+            }
+    
+    return st.session_state["table_editor_states"][task_id].get(table_key, None)
+
+def update_table_editor_state(task_id, table_idx, updates):
+    """Atualiza o estado do editor para uma tabela"""
+    table_key = f"table_{table_idx}"
+    if task_id in st.session_state["table_editor_states"] and table_key in st.session_state["table_editor_states"][task_id]:
+        st.session_state["table_editor_states"][task_id][table_key].update(updates)
+        return True
+    return False
+
+def show_materials_table_editor(task_id, table_idx):
+    """Mostra editor para uma tabela específica (VERSÃO ESTÁVEL)"""
+    # Obter tabela atual
+    if task_id not in st.session_state["materials_tables"]:
+        st.session_state["materials_tables"][task_id] = load_task_materials_tables(task_id)
+    
+    tables = st.session_state["materials_tables"][task_id]
+    
+    if table_idx >= len(tables):
+        st.error("Índice de tabela inválido")
+        return
+    
+    table = tables[table_idx]
+    
+    # Obter ou inicializar estado do editor
+    editor_state = get_table_editor_state(task_id, table_idx)
+    if editor_state is None:
+        editor_state = {
+            "name": table.get("name", f"Tabela {table_idx + 1}"),
+            "rows": table.get("rows", 3),
+            "cols": table.get("cols", 4),
+            "headers": table.get("headers", ["Material", "Quantidade", "Unidade", "Observações"]).copy(),
+            "data": [row.copy() for row in table.get("data", [])],
+            "has_data": table.get("has_data", False)
+        }
+        update_table_editor_state(task_id, table_idx, editor_state)
+    
+    st.markdown(f"#### 📊 {editor_state['name']}")
+    
+    with st.container(border=True):
+        # Configurações da tabela - sem usar st.form para evitar reset
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            new_rows = st.number_input(
+                "Linhas", 
+                min_value=1, 
+                max_value=50, 
+                value=editor_state["rows"],
+                key=f"rows_{task_id}_{table_idx}_{editor_state['name']}"
+            )
+        with col2:
+            new_cols = st.number_input(
+                "Colunas", 
+                min_value=2, 
+                max_value=10, 
+                value=editor_state["cols"],
+                key=f"cols_{task_id}_{table_idx}_{editor_state['name']}"
+            )
+        with col3:
+            new_name = st.text_input(
+                "Nome", 
+                value=editor_state["name"],
+                key=f"name_{task_id}_{table_idx}_{editor_state['name']}"
+            )
+        with col4:
+            st.write("")
+            st.write("")
+            if st.button("🔄 Atualizar Tamanho", 
+                        key=f"update_size_{task_id}_{table_idx}_{editor_state['name']}",
+                        use_container_width=True):
+                # Atualizar estado do editor
+                editor_state["rows"] = new_rows
+                editor_state["cols"] = new_cols
+                editor_state["name"] = new_name
+                
+                # Ajustar dados se necessário
+                current_data = editor_state["data"]
+                adjusted_data = []
+                
+                for r in range(new_rows):
+                    if r < len(current_data):
+                        row = current_data[r]
+                        if new_cols > len(row):
+                            # Adicionar células vazias
+                            row = row + [""] * (new_cols - len(row))
+                        elif new_cols < len(row):
+                            # Remover células extras
+                            row = row[:new_cols]
+                    else:
+                        # Nova linha
+                        row = [""] * new_cols
+                    
+                    adjusted_data.append(row)
+                
+                editor_state["data"] = adjusted_data
+                
+                # Ajustar cabeçalhos se necessário
+                current_headers = editor_state["headers"]
+                if new_cols > len(current_headers):
+                    for i in range(len(current_headers), new_cols):
+                        current_headers.append(f"Coluna {i+1}")
+                elif new_cols < len(current_headers):
+                    current_headers = current_headers[:new_cols]
+                
+                editor_state["headers"] = current_headers
+                
+                update_table_editor_state(task_id, table_idx, editor_state)
+                st.rerun()
+        
+        st.divider()
+        
+        # Definir cabeçalhos
+        st.markdown("**Cabeçalhos das colunas:**")
+        header_cols = st.columns(new_cols)
+        new_headers = []
+        
+        for i in range(new_cols):
+            with header_cols[i]:
+                default_header = editor_state["headers"][i] if i < len(editor_state["headers"]) else f"Coluna {i+1}"
+                header = st.text_input(
+                    f"Coluna {i+1}", 
+                    value=default_header,
+                    key=f"header_{task_id}_{table_idx}_{i}_{editor_state['name']}",
+                    label_visibility="collapsed"
+                )
+                new_headers.append(header)
+        
+        # Atualizar headers se mudaram
+        if new_headers != editor_state["headers"]:
+            editor_state["headers"] = new_headers
+            update_table_editor_state(task_id, table_idx, {"headers": new_headers})
+        
+        st.divider()
+        
+        # Editor da tabela
+        st.markdown("**Preencha os dados da tabela:**")
+        
+        # Garantir que temos dados para todas as células
+        data = editor_state["data"]
+        if len(data) < new_rows:
+            for _ in range(new_rows - len(data)):
+                data.append([""] * new_cols)
+        
+        # Renderizar tabela editável
+        cell_updates = {}
+        for r in range(new_rows):
+            row_cols = st.columns(new_cols)
+            for c in range(new_cols):
+                with row_cols[c]:
+                    # Garantir que a linha tem colunas suficientes
+                    if r < len(data):
+                        if c < len(data[r]):
+                            cell_value = data[r][c]
+                        else:
+                            # Adicionar células faltantes
+                            data[r].append("")
+                            cell_value = ""
+                    else:
+                        # Adicionar linha faltante
+                        data.append([""] * new_cols)
+                        cell_value = ""
+                    
+                    # Input para célula
+                    new_value = st.text_input(
+                        "",
+                        value=cell_value,
+                        key=f"cell_{task_id}_{table_idx}_{r}_{c}_{editor_state['name']}",
+                        label_visibility="collapsed",
+                        placeholder=f"Linha {r+1}, Coluna {c+1}"
+                    )
+                    
+                    # Armazenar atualização se necessário
+                    if new_value != cell_value:
+                        cell_updates[(r, c)] = new_value
+        
+        # Aplicar atualizações de células
+        if cell_updates:
+            for (r, c), value in cell_updates.items():
+                if r < len(data):
+                    if c < len(data[r]):
+                        data[r][c] = value
+                    else:
+                        # Garantir que a linha tenha células suficientes
+                        while len(data[r]) <= c:
+                            data[r].append("")
+                        data[r][c] = value
+                else:
+                    # Criar nova linha se necessário
+                    new_row = [""] * new_cols
+                    new_row[c] = value
+                    data.append(new_row)
+            
+            editor_state["data"] = data
+            update_table_editor_state(task_id, table_idx, {"data": data})
+        
+        # Verificar se há dados
+        editor_state["has_data"] = any(
+            any(cell.strip() for cell in row) 
+            for row in editor_state["data"]
+        )
+        
+        st.divider()
+        
+        # Botões de ação
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            if st.button("💾 Salvar Tabela", 
+                        key=f"save_table_{task_id}_{table_idx}_{editor_state['name']}",
+                        use_container_width=True,
+                        type="primary"):
+                # Atualizar tabela principal com dados do editor
+                updated_table = {
+                    "id": table.get("id", str(uuid.uuid4())),
+                    "name": editor_state["name"],
+                    "rows": editor_state["rows"],
+                    "cols": editor_state["cols"],
+                    "data": editor_state["data"],
+                    "headers": editor_state["headers"],
+                    "has_data": editor_state["has_data"]
+                }
+                
+                # Atualizar na sessão
+                if table_idx < len(tables):
+                    tables[table_idx] = updated_table
+                    st.session_state["materials_tables"][task_id] = tables
+                
+                # Salvar no banco
+                if save_task_materials_tables(task_id, tables):
+                    st.success("✅ Tabela salva com sucesso!")
+                    st.rerun()
+        
+        with col2:
+            if st.button("➕ Adicionar Linha", 
+                        key=f"add_row_{task_id}_{table_idx}_{editor_state['name']}",
+                        use_container_width=True):
+                editor_state["data"].append([""] * editor_state["cols"])
+                editor_state["rows"] += 1
+                update_table_editor_state(task_id, table_idx, {
+                    "data": editor_state["data"],
+                    "rows": editor_state["rows"]
+                })
+                st.rerun()
+        
+        with col3:
+            if st.button("🗑️ Limpar Tabela", 
+                        key=f"clear_table_{task_id}_{table_idx}_{editor_state['name']}",
+                        use_container_width=True):
+                editor_state["data"] = [["" for _ in range(editor_state["cols"])] for _ in range(editor_state["rows"])]
+                editor_state["has_data"] = False
+                update_table_editor_state(task_id, table_idx, {
+                    "data": editor_state["data"],
+                    "has_data": editor_state["has_data"]
+                })
+                st.rerun()
+        
+        with col4:
+            if len(tables) > 1:
+                if st.button("❌ Remover Tabela", 
+                            key=f"remove_table_{task_id}_{table_idx}_{editor_state['name']}",
+                            use_container_width=True,
+                            type="secondary"):
+                    # Remover da lista
+                    tables.pop(table_idx)
+                    st.session_state["materials_tables"][task_id] = tables
+                    
+                    # Limpar estado do editor
+                    table_key = f"table_{table_idx}"
+                    if task_id in st.session_state["table_editor_states"] and table_key in st.session_state["table_editor_states"][task_id]:
+                        del st.session_state["table_editor_states"][task_id][table_key]
+                    
+                    # Salvar no banco
+                    if save_task_materials_tables(task_id, tables):
+                        st.success("✅ Tabela removida!")
+                        st.rerun()
+            else:
+                st.button("❌ Remover Tabela", 
+                         disabled=True, 
+                         help="Não é possível remover a última tabela",
+                         use_container_width=True)
+
 def show_materials_tables_manager(task_id, tables=None):
     """Mostra o gerenciador de tabelas de materiais para uma tarefa específica"""
     if tables is None:
@@ -259,35 +670,61 @@ def show_materials_tables_manager(task_id, tables=None):
     
     st.markdown("#### 📋 Gerenciador de Tabelas de Materiais")
     
-    # Criar tabs para cada tabela
-    tab_titles = [f"{table['name']}" for table in tables]
-    tab_titles.append("➕ Nova Tabela")
+    # Usar uma abordagem com radio buttons para tabs estáveis
+    tab_options = [f"📊 {table['name']}" for table in tables]
+    tab_options.append("➕ Nova Tabela")
     
-    tabs = st.tabs(tab_titles)
+    # Inicializar seleção de tab
+    tab_key = f"tab_selection_{task_id}"
+    if tab_key not in st.session_state:
+        st.session_state[tab_key] = 0
     
-    # Tabs para cada tabela existente
-    for i, tab in enumerate(tabs[:-1]):  # Excluir a última tab (nova tabela)
-        with tab:
-            show_materials_table_editor(task_id, i)
+    # Seletor de tabs
+    selected_tab_index = st.radio(
+        "Selecione uma tabela:",
+        options=list(range(len(tab_options))),
+        format_func=lambda i: tab_options[i],
+        horizontal=True,
+        key=f"tab_radio_{task_id}",
+        label_visibility="collapsed"
+    )
     
-    # Última tab para adicionar nova tabela
-    with tabs[-1]:
+    st.divider()
+    
+    # Conteúdo da tab selecionada
+    if selected_tab_index == len(tables):  # Última tab é "Nova Tabela"
         st.markdown("#### ➕ Criar Nova Tabela de Materiais")
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            new_name = st.text_input("Nome da nova tabela", 
-                                    value=f"Tabela de Materiais {len(tables) + 1}",
-                                    key=f"new_table_name_{task_id}")
+            new_name = st.text_input(
+                "Nome da nova tabela", 
+                value=f"Tabela de Materiais {len(tables) + 1}",
+                key=f"new_table_name_{task_id}"
+            )
         with col2:
-            new_rows = st.number_input("Linhas", min_value=1, max_value=50, value=3,
-                                     key=f"new_table_rows_{task_id}")
+            new_rows = st.number_input(
+                "Linhas", 
+                min_value=1, 
+                max_value=50, 
+                value=3,
+                key=f"new_table_rows_{task_id}"
+            )
         with col3:
-            new_cols = st.number_input("Colunas", min_value=2, max_value=10, value=4,
-                                     key=f"new_table_cols_{task_id}")
+            new_cols = st.number_input(
+                "Colunas", 
+                min_value=2, 
+                max_value=10, 
+                value=4,
+                key=f"new_table_cols_{task_id}"
+            )
         
-        if st.button("✅ Criar Nova Tabela", use_container_width=True, type="primary",
-                    key=f"create_table_btn_{task_id}"):
+        if st.button(
+            "✅ Criar Nova Tabela", 
+            use_container_width=True, 
+            type="primary",
+            key=f"create_table_btn_{task_id}"
+        ):
             # Criar nova tabela
             new_table = create_default_table()
             new_table["name"] = new_name
@@ -308,194 +745,53 @@ def show_materials_tables_manager(task_id, tables=None):
             st.success(f"✅ Nova tabela '{new_name}' criada!")
             st.rerun()
     
+    else:
+        # Mostrar editor da tabela selecionada
+        show_materials_table_editor(task_id, selected_tab_index)
+    
     # Visualização consolidada
     st.divider()
     st.markdown("#### 👁️ Visualização Consolidada")
     
-    has_any_data = any(table["has_data"] for table in tables)
+    has_any_data = any(table.get("has_data", False) for table in tables)
     
     if has_any_data:
         for table_idx, table in enumerate(tables):
-            if table["has_data"]:
+            if table.get("has_data"):
                 st.markdown(f"**{table['name']}**")
                 
                 # Usar DataFrame para melhor visualização
                 df_data = []
-                headers = table["headers"]
+                headers = table.get("headers", [])
                 
-                for row in table["data"]:
+                for row in table.get("data", []):
                     if any(cell.strip() for cell in row):
+                        # Garantir que a linha tenha o mesmo número de colunas que os cabeçalhos
+                        if len(row) != len(headers):
+                            # Ajustar o tamanho da linha
+                            if len(row) < len(headers):
+                                row = row + [""] * (len(headers) - len(row))
+                            else:
+                                row = row[:len(headers)]
                         df_data.append(row)
                 
                 if df_data:
-                    df = pd.DataFrame(df_data, columns=headers)
-                    st.dataframe(df, use_container_width=True)
-                    
-                    # Contar itens
-                    item_count = len(df_data)
-                    st.caption(f"Total de itens nesta tabela: {item_count}")
+                    try:
+                        df = pd.DataFrame(df_data, columns=headers)
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        
+                        # Contar itens
+                        item_count = len(df_data)
+                        st.caption(f"Total de itens nesta tabela: {item_count}")
+                    except Exception as e:
+                        st.error(f"Erro ao exibir tabela: {str(e)}")
+                        # Mostrar dados brutos
+                        st.write("Dados da tabela:")
+                        for i, row in enumerate(df_data, 1):
+                            st.write(f"Linha {i}: {row}")
                 st.divider()
     else:
-        st.info("Nenhuma tabela contém dados. Preencha as tabelas acima.")
-
-def show_materials_table_editor(task_id, table_idx):
-    """Mostra editor para uma tabela específica"""
-    if task_id not in st.session_state["materials_tables"]:
-        st.session_state["materials_tables"][task_id] = load_task_materials_tables(task_id)
-    
-    tables = st.session_state["materials_tables"][task_id]
-    
-    if table_idx >= len(tables):
-        st.error("Índice de tabela inválido")
-        return
-    
-    table = tables[table_idx]
-    
-    st.markdown(f"#### 📊 {table['name']}")
-    
-    with st.container(border=True):
-        # Configurações da tabela
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            rows = st.number_input("Número de linhas", min_value=1, max_value=50, 
-                                  value=table["rows"], 
-                                  key=f"mat_rows_{task_id}_{table_idx}")
-        with col2:
-            cols = st.number_input("Número de colunas", min_value=2, max_value=10, 
-                                  value=table["cols"], 
-                                  key=f"mat_cols_{task_id}_{table_idx}")
-        with col3:
-            table_name = st.text_input("Nome da tabela", 
-                                      value=table["name"],
-                                      key=f"table_name_{task_id}_{table_idx}")
-        with col4:
-            st.write("")
-            st.write("")
-            if st.button("🔄 Atualizar", 
-                        key=f"update_table_{task_id}_{table_idx}",
-                        use_container_width=True):
-                # Redimensionar tabela se necessário
-                if rows != table["rows"] or cols != table["cols"]:
-                    new_data = []
-                    for r in range(rows):
-                        row = []
-                        for c in range(cols):
-                            if r < table["rows"] and c < table["cols"]:
-                                row.append(table["data"][r][c])
-                            else:
-                                row.append("")
-                        new_data.append(row)
-                    table["data"] = new_data
-                
-                table["rows"] = rows
-                table["cols"] = cols
-                table["name"] = table_name
-                
-                # Ajustar cabeçalhos se necessário
-                while len(table["headers"]) < cols:
-                    table["headers"].append(f"Coluna {len(table['headers']) + 1}")
-                while len(table["headers"]) > cols:
-                    table["headers"].pop()
-                
-                st.rerun()
-        
-        st.divider()
-        
-        # Definir cabeçalhos
-        st.markdown("**Cabeçalhos das colunas:**")
-        header_cols = st.columns(cols)
-        for i in range(cols):
-            with header_cols[i]:
-                default_header = table["headers"][i] if i < len(table["headers"]) else f"Coluna {i+1}"
-                header = st.text_input(f"Coluna {i+1}", value=default_header, 
-                                     key=f"header_{task_id}_{table_idx}_{i}")
-                if i >= len(table["headers"]):
-                    table["headers"].append(header)
-                else:
-                    table["headers"][i] = header
-        
-        st.divider()
-        
-        # Editor da tabela
-        st.markdown("**Preencha os dados da tabela:**")
-        
-        # Garantir tamanho correto
-        if len(table["data"]) != rows:
-            table["data"] = table["data"][:rows] if rows < len(table["data"]) else table["data"] + [["" for _ in range(cols)] for _ in range(rows - len(table["data"]))]
-        
-        for i in range(rows):
-            if len(table["data"][i]) != cols:
-                table["data"][i] = table["data"][i][:cols] if cols < len(table["data"][i]) else table["data"][i] + ["" for _ in range(cols - len(table["data"][i]))]
-        
-        # Renderizar tabela editável
-        for r in range(rows):
-            row_cols = st.columns(cols)
-            for c in range(cols):
-                with row_cols[c]:
-                    value = table["data"][r][c] if r < len(table["data"]) and c < len(table["data"][r]) else ""
-                    new_value = st.text_input(
-                        "",
-                        value=value,
-                        key=f"cell_{task_id}_{table_idx}_{r}_{c}",
-                        label_visibility="collapsed",
-                        placeholder=f"Linha {r+1}, Coluna {c+1}"
-                    )
-                    table["data"][r][c] = new_value
-        
-        # Verificar se há dados
-        table["has_data"] = any(
-            any(cell.strip() for cell in row) 
-            for row in table["data"]
-        )
-        
-        st.divider()
-        
-        # Botões de ação
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            if st.button("💾 Salvar Tabela", 
-                        key=f"save_table_{task_id}_{table_idx}",
-                        use_container_width=True,
-                        type="primary"):
-                # Atualizar na sessão
-                st.session_state["materials_tables"][task_id][table_idx] = table
-                
-                # Salvar no banco
-                if save_task_materials_tables(task_id, st.session_state["materials_tables"][task_id]):
-                    st.success("✅ Tabela salva com sucesso!")
-                    st.rerun()
-        
-        with col2:
-            if st.button("➕ Adicionar Linha", 
-                        key=f"add_row_{task_id}_{table_idx}",
-                        use_container_width=True):
-                table["data"].append(["" for _ in range(cols)])
-                table["rows"] += 1
-                st.rerun()
-        
-        with col3:
-            if st.button("🗑️ Limpar Tabela", 
-                        key=f"clear_table_{task_id}_{table_idx}",
-                        use_container_width=True):
-                table["data"] = [["" for _ in range(cols)] for _ in range(rows)]
-                table["has_data"] = False
-                st.rerun()
-        
-        with col4:
-            if st.button("❌ Remover Tabela", 
-                        key=f"remove_table_{task_id}_{table_idx}",
-                        use_container_width=True,
-                        type="secondary"):
-                if len(tables) > 1:
-                    tables.pop(table_idx)
-                    
-                    # Salvar no banco
-                    if save_task_materials_tables(task_id, tables):
-                        st.success("✅ Tabela removida!")
-                        st.rerun()
-                else:
-                    st.warning("Não é possível remover a última tabela")
+        st.info("ℹ️ Nenhuma tabela contém dados. Preencha as tabelas acima.")
 
 # ----------- FUNÇÕES PARA VISUALIZAÇÃO DE TABELAS -----------
 
@@ -503,47 +799,88 @@ def render_materials_tables(task_id):
     """Renderiza as tabelas de materiais em formato visual"""
     tables = load_task_materials_tables(task_id)
     
-    if not any(table["has_data"] for table in tables):
+    if not any(table.get("has_data", False) for table in tables):
         return False
     
     st.markdown("### 📋 Lista de Materiais")
     
     for table_idx, table in enumerate(tables):
-        if table["has_data"]:
+        if table.get("has_data", False):
             st.markdown(f"**{table['name']}**")
             
             # Filtrar apenas linhas com dados
             data_with_content = []
-            for row in table["data"]:
+            headers = table.get("headers", [])
+            
+            for row in table.get("data", []):
                 if any(cell.strip() for cell in row):
+                    # Garantir que a linha tenha o mesmo número de colunas que os cabeçalhos
+                    if len(row) != len(headers):
+                        # Ajustar o tamanho da linha
+                        if len(row) < len(headers):
+                            # Adicionar células vazias se faltarem
+                            row = row + [""] * (len(headers) - len(row))
+                        else:
+                            # Cortar se houver células extras
+                            row = row[:len(headers)]
                     data_with_content.append(row)
             
             if data_with_content:
-                # Criar DataFrame para melhor visualização
-                df = pd.DataFrame(data_with_content, columns=table["headers"])
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                
-                # Botões de ação para esta tabela
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    if st.button("✏️ Editar Tabela", 
-                                key=f"edit_table_{task_id}_{table_idx}",
-                                use_container_width=True):
-                        st.session_state["active_materials_editor"] = task_id
-                        st.rerun()
-                with col2:
-                    # Botão para exportar esta tabela
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Exportar CSV",
-                        data=csv,
-                        file_name=f"materiais_{table['name'].replace(' ', '_')}.csv",
-                        mime="text/csv",
-                        key=f"export_{task_id}_{table_idx}",
-                        use_container_width=True
-                    )
-                
-                st.divider()
+                try:
+                    # Verificar se todas as linhas têm o mesmo número de colunas que os cabeçalhos
+                    valid_rows = []
+                    for row in data_with_content:
+                        if len(row) == len(headers):
+                            valid_rows.append(row)
+                        else:
+                            # Se não tiver o mesmo tamanho, ajustar
+                            if len(row) < len(headers):
+                                # Adicionar células vazias
+                                row = row + [""] * (len(headers) - len(row))
+                            else:
+                                # Cortar células extras
+                                row = row[:len(headers)]
+                            valid_rows.append(row)
+                    
+                    # Criar DataFrame
+                    df = pd.DataFrame(valid_rows, columns=headers)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    
+                    # Botões de ação para esta tabela
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        if st.button(
+                            "✏️ Editar Tabela", 
+                            key=f"edit_table_{task_id}_{table_idx}",
+                            use_container_width=True
+                        ):
+                            st.session_state["active_materials_editor"] = task_id
+                            st.rerun()
+                    
+                    with col2:
+                        # Botão para exportar esta tabela
+                        try:
+                            csv = df.to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button(
+                                "📥 Exportar CSV",
+                                data=csv,
+                                file_name=f"materiais_{table['name'].replace(' ', '_')}.csv",
+                                mime="text/csv",
+                                key=f"export_{task_id}_{table_idx}",
+                                use_container_width=True
+                            )
+                        except Exception as e:
+                            st.error(f"Erro ao exportar: {str(e)}")
+                    
+                    st.divider()
+                    
+                except Exception as e:
+                    st.error(f"❌ Erro ao exibir tabela '{table['name']}': {str(e)}")
+                    # Mostrar dados brutos como fallback
+                    st.write("**Dados da tabela (modo de emergência):**")
+                    for i, row in enumerate(data_with_content, 1):
+                        st.write(f"**Linha {i}:** {row}")
+                    st.divider()
     
     return True
 
@@ -553,16 +890,37 @@ def materials_tables_to_dataframes(task_id):
     dataframes = []
     
     for table in tables:
-        if table["has_data"]:
+        if table.get("has_data", False):
             # Filtrar apenas linhas com dados
             data_with_content = []
-            for row in table["data"]:
+            headers = table.get("headers", [])
+            
+            for row in table.get("data", []):
                 if any(cell.strip() for cell in row):
+                    # Garantir que a linha tenha o mesmo número de colunas que os cabeçalhos
+                    if len(row) != len(headers):
+                        if len(row) < len(headers):
+                            row = row + [""] * (len(headers) - len(row))
+                        else:
+                            row = row[:len(headers)]
                     data_with_content.append(row)
             
             if data_with_content:
-                df = pd.DataFrame(data_with_content, columns=table["headers"])
-                dataframes.append((table["name"], df))
+                try:
+                    # Ajustar todas as linhas
+                    valid_rows = []
+                    for row in data_with_content:
+                        if len(row) != len(headers):
+                            if len(row) < len(headers):
+                                row = row + [""] * (len(headers) - len(row))
+                            else:
+                                row = row[:len(headers)]
+                        valid_rows.append(row)
+                    
+                    df = pd.DataFrame(valid_rows, columns=headers)
+                    dataframes.append((table["name"], df))
+                except Exception as e:
+                    print(f"Erro ao converter tabela '{table['name']}' para DataFrame: {e}")
     
     return dataframes
 
@@ -859,82 +1217,6 @@ def generate_pdf(task, technician_name, location_name, checklist_items, image_pa
     pdf.cell(0, 6, f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}", 0, 0, 'C')
     
     return bytes(pdf.output(dest='S'))
-
-# ----------- FUNÇÕES DE ANEXOS -----------
-
-def sanitize_filename(filename):
-    """Sanitiza nome do arquivo"""
-    name, ext = os.path.splitext(filename)
-    name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-    unique_id = str(uuid.uuid4())[:8]
-    return f"{name}_{unique_id}{ext}"
-
-def handle_file_upload(task_id, uploaded_file):
-    """Processa upload de arquivo"""
-    try:
-        upload_key = f"{task_id}_{uploaded_file.name}_{uploaded_file.size}"
-        if upload_key in st.session_state.uploaded_files:
-            st.warning("📎 Este arquivo já foi enviado.")
-            return
-        
-        safe_filename = sanitize_filename(uploaded_file.name)
-        file_path = f"{task_id}/{safe_filename}"
-        
-        supabase.storage.from_("task-attachments").upload(
-            file_path, 
-            uploaded_file.getvalue(), 
-            file_options={"content-type": uploaded_file.type}
-        )
-        
-        st.session_state.uploaded_files[upload_key] = True
-        st.toast("✅ Imagem anexada!", icon="🖼️")
-        st.rerun()
-    except Exception as e:
-        st.error(f"Erro ao enviar: {str(e)}")
-
-def load_attachments(task_id):
-    """Carrega anexos de uma tarefa"""
-    try:
-        return supabase.storage.from_("task-attachments").list(task_id) or []
-    except:
-        return []
-
-def get_attachment_url(task_id, filename):
-    """Obtém URL pública do anexo"""
-    try:
-        return supabase.storage.from_("task-attachments").get_public_url(f"{task_id}/{filename}")
-    except:
-        return None
-
-def is_image_file(filepath):
-    """Verifica se arquivo é imagem"""
-    return filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff'))
-
-def download_attachments_to_temp(task_id, attachments):
-    """Baixa anexos para diretório temporário"""
-    if not attachments:
-        return [], None
-    
-    temp_dir = tempfile.mkdtemp()
-    image_paths = []
-    
-    for att in attachments:
-        if not is_image_file(att['name']):
-            continue
-        
-        try:
-            file_path = f"{task_id}/{att['name']}"
-            file_data = supabase.storage.from_("task-attachments").download(file_path)
-            local_path = os.path.join(temp_dir, att['name'])
-            
-            with open(local_path, 'wb') as f:
-                f.write(file_data)
-            
-            image_paths.append(local_path)
-        except:
-            pass
-    
-    return image_paths, temp_dir
 
 # ----------- FUNÇÕES DE RECORRÊNCIA E STATUS -----------
 
