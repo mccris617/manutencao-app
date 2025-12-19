@@ -1626,8 +1626,8 @@ def show_new_activity_form():
                         res = supabase.table("maintenance_tasks").insert(new_task).execute()
                         new_task_id = res.data[0]["id"] if res.data else None
                         if new_task_id:
-                            if checklist_items:
-                                items = [item.strip() for item in checklist_text.split("\n") if item.strip()]
+                            items = [item.strip() for item in checklist_text.split("\n") if item.strip()]
+                            if items:
                                 for item in items:
                                     supabase.table("checklists").insert({
                                         "task_id": new_task_id,
@@ -1806,8 +1806,8 @@ def show_clone_form():
                         res = supabase.table("maintenance_tasks").insert(new_task).execute()
                         new_task_id = res.data[0]["id"] if res.data else None
                         if new_task_id:
-                            if checklist_items:
-                                items = [item.strip() for item in checklist_text.split("\n") if item.strip()]
+                            items = [item.strip() for item in checklist_text.split("\n") if item.strip()]
+                            if items:
                                 for item in items:
                                     supabase.table("checklists").insert({
                                         "task_id": new_task_id,
